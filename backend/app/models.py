@@ -77,6 +77,25 @@ class Subscription(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     user: Mapped[User] = relationship(back_populates='subscriptions')
+    details: Mapped['SubscriptionDetails | None'] = relationship(
+        cascade='all, delete-orphan', lazy='selectin', single_parent=True,
+    )
+
+
+class SubscriptionDetails(Base):
+    __tablename__ = 'subscription_details'
+    subscription_id: Mapped[str] = mapped_column(ForeignKey('subscriptions.id'), primary_key=True)
+    bank_name: Mapped[str | None] = mapped_column(String(80))
+    last_payment_date: Mapped[date | None] = mapped_column(Date)
+
+
+class Service(Base):
+    __tablename__ = 'services'
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
+    category: Mapped[str] = mapped_column(String(80), nullable=False)
+    icon: Mapped[str] = mapped_column(String(30), nullable=False)
+    aliases: Mapped[str] = mapped_column(Text, nullable=False)
 
 
 class CatalogPlan(Base):

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -12,6 +13,8 @@ import 'package:timezone/timezone.dart' as tz;
 
 import 'api.dart';
 import 'reminders.dart';
+import 'statement_page.dart';
+import 'subscription_intake.dart';
 import 'tree_art.dart';
 
 const background = Color(0xFF0D0718);
@@ -40,16 +43,62 @@ class SubscriptionTreeApp extends StatefulWidget {
 class _SubscriptionTreeAppState extends State<SubscriptionTreeApp>
     with WidgetsBindingObserver {
   final api = ApiClient();
+  final navigator = GlobalKey<NavigatorState>();
+  static const intake = MethodChannel('moneytree/intake');
+  final sharedText = <String>[];
+  bool reviewingShare = false;
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    api.addListener(reviewSharedText);
+    intake.setMethodCallHandler((call) async {
+      if (call.method == 'sharedTextAvailable') await takeSharedText();
+    });
+    unawaited(takeSharedText());
     api.init();
+  }
+
+  Future<void> takeSharedText() async {
+    try {
+      final texts = await intake.invokeListMethod<String>('takeSharedText');
+      if (!mounted || texts == null) return;
+      sharedText.addAll(texts.where((text) => text.trim().isNotEmpty));
+      reviewSharedText();
+    } on MissingPluginException {
+      // This host has no system share target.
+    } on PlatformException {
+      // Keep the normal app usable if the system share inbox is unavailable.
+    }
+  }
+
+  void reviewSharedText() {
+    if (reviewingShare || !api.canOpen || api.loading || sharedText.isEmpty) {
+      return;
+    }
+    reviewingShare = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      try {
+        final context = navigator.currentContext;
+        if (!mounted || !api.canOpen || context == null) return;
+        final draft = sharedSubscriptionDraft(
+          sharedText.removeAt(0),
+          api.services,
+        );
+        await showSubscriptionForm(context, api, draft: draft);
+      } finally {
+        reviewingShare = false;
+        if (mounted && navigator.currentContext != null) reviewSharedText();
+      }
+    });
+    WidgetsBinding.instance.ensureVisualUpdate();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    intake.setMethodCallHandler(null);
+    api.removeListener(reviewSharedText);
     api.dispose();
     super.dispose();
   }
@@ -57,6 +106,7 @@ class _SubscriptionTreeAppState extends State<SubscriptionTreeApp>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
+      unawaited(takeSharedText());
       refreshDeviceTimeZone();
     }
   }
@@ -75,6 +125,7 @@ class _SubscriptionTreeAppState extends State<SubscriptionTreeApp>
   Widget build(BuildContext context) => AnimatedBuilder(
     animation: api,
     builder: (_, _) => MaterialApp(
+      navigatorKey: navigator,
       title: 'Денежное дерево',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
@@ -445,6 +496,9 @@ class _HomePageState extends State<HomePage> {
                 case 'manual':
                   await showSubscriptionForm(context, widget.api);
                   break;
+                case 'statement':
+                  await showStatementImport(context, widget.api);
+                  break;
                 case 'connect':
                   await showIntegrations(context, widget.api);
                   break;
@@ -472,6 +526,10 @@ class _HomePageState extends State<HomePage> {
               const PopupMenuItem(
                 value: 'manual',
                 child: Text('Добавить вручную'),
+              ),
+              const PopupMenuItem(
+                value: 'statement',
+                child: Text('Импортировать выписку'),
               ),
               const PopupMenuItem(
                 value: 'connect',
@@ -525,20 +583,14 @@ DateTime chargeDate(Map<String, dynamic> s, {DateTime? now}) {
   now ??= tz.TZDateTime.now(tz.local);
   var date = DateTime.tryParse(s['next_charge_date']?.toString() ?? '') ?? now;
   if (s['status'] != 'active') return date;
-  final today = DateTime.utc(now.year, now.month, now.day);
   final anchor = (s['anchor_day'] as num?)?.toInt() ?? date.day;
-  while (DateTime.utc(date.year, date.month, date.day).isBefore(today)) {
-    if (s['period'] == 'weekly') {
-      date = date.add(const Duration(days: 7));
-    } else {
-      final months =
-          {'monthly': 1, 'quarterly': 3, 'yearly': 12}[s['period']] ?? 1;
-      final first = DateTime(date.year, date.month + months, 1);
-      final last = DateTime(first.year, first.month + 1, 0).day;
-      date = DateTime(first.year, first.month, math.min(anchor, last));
-    }
-  }
-  return date;
+  final upcoming = upcomingCharge(
+    date,
+    s['period']?.toString() ?? 'monthly',
+    anchor,
+    now,
+  );
+  return DateTime(upcoming.year, upcoming.month, upcoming.day);
 }
 
 int daysUntil(Map<String, dynamic> s) {
@@ -555,6 +607,7 @@ String readableDate(Map<String, dynamic> s) =>
     DateFormat('d MMMM yyyy', 'ru').format(chargeDate(s));
 String periodName(String? period) =>
     const {
+      'daily': 'день',
       'weekly': 'неделя',
       'monthly': 'месяц',
       'quarterly': '3 месяца',
@@ -710,6 +763,7 @@ class _TreePageState extends State<TreePage>
         for (final s in soon)
           SubscriptionTile(
             data: s,
+            service: widget.api.services.lookup(s['name']?.toString()),
             onTap: () => showSubscriptionForm(context, widget.api, existing: s),
           ),
       ],
@@ -754,18 +808,58 @@ class _TreePageState extends State<TreePage>
   }
 }
 
-class SubscriptionsPage extends StatelessWidget {
+Future<void> showStatementImport(BuildContext context, ApiClient api) =>
+    Navigator.of(context).push<void>(
+      MaterialPageRoute(
+        builder: (_) => StatementPage(
+          api: api,
+          onReview: (context, draft) =>
+              showSubscriptionForm(context, api, draft: draft),
+        ),
+      ),
+    );
+
+String statusName(Object? status) => switch (status) {
+  'paused' => 'Приостановлена',
+  'cancelled' => 'Отменена',
+  _ => 'Активна',
+};
+
+class SubscriptionsPage extends StatefulWidget {
   const SubscriptionsPage({super.key, required this.api});
   final ApiClient api;
   @override
+  State<SubscriptionsPage> createState() => _SubscriptionsPageState();
+}
+
+class _SubscriptionsPageState extends State<SubscriptionsPage> {
+  String status = 'all';
+  String query = '';
+
+  @override
   Widget build(BuildContext context) {
-    final rows = [...api.subscriptions]
-      ..sort((a, b) {
-        final status = (a['status'] == 'active' ? 0 : 1).compareTo(
-          b['status'] == 'active' ? 0 : 1,
-        );
-        return status != 0 ? status : chargeDate(a).compareTo(chargeDate(b));
-      });
+    final api = widget.api;
+    final directory = api.services;
+    final rows =
+        api.subscriptions.where((row) {
+          final service = directory.lookup(row['name']?.toString());
+          final searchText = normalizedService(
+            [
+              row['name'],
+              row['plan_name'],
+              row['category'],
+              row['bank_name'],
+              ...?service?.aliases,
+            ].whereType<String>().join(' '),
+          );
+          return (status == 'all' || status == row['status']) &&
+              searchText.contains(normalizedService(query));
+        }).toList()..sort((a, b) {
+          final status = (a['status'] == 'active' ? 0 : 1).compareTo(
+            b['status'] == 'active' ? 0 : 1,
+          );
+          return status != 0 ? status : chargeDate(a).compareTo(chargeDate(b));
+        });
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -779,27 +873,49 @@ class SubscriptionsPage extends StatelessWidget {
             'Офлайн: можно добавлять и изменять подписки',
             style: TextStyle(color: Colors.orangeAccent),
           ),
-        if (api.subscriptions.isEmpty)
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(24),
-              child: Column(
-                children: [
-                  const Icon(Icons.add_circle_outline, size: 48, color: pink),
-                  const SizedBox(height: 12),
-                  const Text('Подписок пока нет'),
-                  const SizedBox(height: 12),
-                  FilledButton(
-                    onPressed: () => showSubscriptionForm(context, api),
-                    child: const Text('Добавить подписку'),
-                  ),
-                ],
-              ),
+        FilledButton.icon(
+          onPressed: () => showStatementImport(context, api),
+          icon: const Icon(Icons.file_open_outlined),
+          label: const Text('Импортировать выписку'),
+        ),
+        OutlinedButton.icon(
+          onPressed: () => showSubscriptionForm(context, api),
+          icon: const Icon(Icons.add),
+          label: const Text('Добавить вручную'),
+        ),
+        const SizedBox(height: 12),
+        DropdownButtonFormField<String>(
+          initialValue: status,
+          decoration: const InputDecoration(labelText: 'Статус подписок'),
+          items: const [
+            DropdownMenuItem(value: 'all', child: Text('Все')),
+            DropdownMenuItem(value: 'active', child: Text('Активные')),
+            DropdownMenuItem(value: 'paused', child: Text('Приостановленные')),
+            DropdownMenuItem(value: 'cancelled', child: Text('Отменённые')),
+          ],
+          onChanged: (value) => setState(() => status = value!),
+        ),
+        const SizedBox(height: 8),
+        TextField(
+          decoration: const InputDecoration(
+            labelText: 'Поиск по подпискам',
+            prefixIcon: Icon(Icons.search),
+          ),
+          onChanged: (value) => setState(() => query = value),
+        ),
+        const SizedBox(height: 12),
+        if (rows.isEmpty)
+          Center(
+            child: Text(
+              api.subscriptions.isEmpty
+                  ? 'Подписок пока нет'
+                  : 'Подписки не найдены',
             ),
           ),
         for (final s in rows)
           SubscriptionTile(
             data: s,
+            service: directory.lookup(s['name']?.toString()),
             onTap: () => showSubscriptionForm(context, api, existing: s),
           ),
       ],
@@ -808,9 +924,15 @@ class SubscriptionsPage extends StatelessWidget {
 }
 
 class SubscriptionTile extends StatelessWidget {
-  const SubscriptionTile({super.key, required this.data, required this.onTap});
+  const SubscriptionTile({
+    super.key,
+    required this.data,
+    required this.onTap,
+    this.service,
+  });
   final Map<String, dynamic> data;
   final VoidCallback onTap;
+  final SubscriptionService? service;
   @override
   Widget build(BuildContext context) => Card(
     child: ListTile(
@@ -818,16 +940,19 @@ class SubscriptionTile extends StatelessWidget {
       contentPadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
       leading: CircleAvatar(
         backgroundColor: const Color(0xFF612671),
-        child: Text(
-          (data['name']?.toString().isNotEmpty ?? false)
-              ? data['name'].toString()[0].toUpperCase()
-              : '?',
-          style: const TextStyle(color: pale),
-        ),
+        child: service != null
+            ? Icon(serviceIcon(service!.icon), color: pale)
+            : Text(
+                (data['name']?.toString().isNotEmpty ?? false)
+                    ? data['name'].toString()[0].toUpperCase()
+                    : '?',
+                style: const TextStyle(color: pale),
+              ),
       ),
       title: Text(data['name']?.toString() ?? ''),
       subtitle: Text(
-        '${data['plan_name'] ?? periodName(data['period']?.toString())} · ${readableDate(data)}${data['status'] != 'active' ? ' · ${data['status']}' : ''}',
+        '${data['plan_name'] ?? periodName(data['period']?.toString())} · '
+        '${data['status'] == 'active' ? readableDate(data) : statusName(data['status'])}',
       ),
       trailing: Column(
         mainAxisAlignment: MainAxisAlignment.center,
@@ -1136,72 +1261,102 @@ Future<void> showSubscriptionForm(
   BuildContext context,
   ApiClient api, {
   Map<String, dynamic>? existing,
+  Map<String, dynamic>? draft,
 }) async {
   await showModalBottomSheet<void>(
     context: context,
     isScrollControlled: true,
     showDragHandle: true,
-    builder: (_) => SubscriptionForm(api: api, existing: existing),
+    builder: (_) =>
+        SubscriptionForm(api: api, existing: existing, draft: draft),
   );
 }
 
 class SubscriptionForm extends StatefulWidget {
-  const SubscriptionForm({super.key, required this.api, this.existing});
+  const SubscriptionForm({
+    super.key,
+    required this.api,
+    this.existing,
+    this.draft,
+  });
   final ApiClient api;
   final Map<String, dynamic>? existing;
+  final Map<String, dynamic>? draft;
   @override
   State<SubscriptionForm> createState() => _SubscriptionFormState();
 }
 
 class _SubscriptionFormState extends State<SubscriptionForm> {
   final formKey = GlobalKey<FormState>();
+  Map<String, dynamic>? get initial => widget.existing ?? widget.draft;
+  late var service = widget.api.services.lookup(initial?['name']?.toString());
   late final name = TextEditingController(
-    text: widget.existing?['name']?.toString() ?? '',
+    text: initial?['name']?.toString() ?? '',
   );
   late final plan = TextEditingController(
-    text: widget.existing?['plan_name']?.toString() ?? '',
+    text: initial?['plan_name']?.toString() ?? '',
   );
   late final category = TextEditingController(
-    text: widget.existing?['category']?.toString() ?? '',
+    text: initial?['category']?.toString() ?? service?.category ?? '',
   );
   late final amount = TextEditingController(
-    text: widget.existing?['amount']?.toString() ?? '',
+    text: initial?['amount']?.toString() ?? '',
   );
-  late String period = widget.existing?['period']?.toString() ?? 'monthly';
-  late String status = widget.existing?['status']?.toString() ?? 'active';
-  late DateTime nextDate = widget.existing == null
-      ? DateTime.now()
-      : chargeDate(widget.existing!);
+  late final bank = TextEditingController(
+    text: initial?['bank_name']?.toString() ?? '',
+  );
+  late String? period =
+      initial?['period']?.toString() ??
+      (widget.draft == null ? 'monthly' : null);
+  late String status = initial?['status']?.toString() ?? 'active';
+  late String currency = initial?['currency']?.toString() ?? 'RUB';
+  late DateTime? nextDate = widget.existing != null
+      ? chargeDate(widget.existing!)
+      : widget.draft != null
+      ? DateTime.tryParse(initial?['next_charge_date']?.toString() ?? '')
+      : DateTime.now();
   late int anchorDay =
-      (widget.existing?['anchor_day'] as num?)?.toInt() ?? nextDate.day;
+      (initial?['anchor_day'] as num?)?.toInt() ??
+      nextDate?.day ??
+      DateTime.now().day;
   bool busy = false;
+  bool datePicked = false;
   @override
   void dispose() {
     name.dispose();
     plan.dispose();
     category.dispose();
     amount.dispose();
+    bank.dispose();
     super.dispose();
   }
 
   Future<void> save() async {
     if (!formKey.currentState!.validate()) return;
+    if (nextDate == null) {
+      errorSnack(context, 'Укажите дату следующего списания.');
+      return;
+    }
     setState(() => busy = true);
     try {
       await ReminderService.instance.updateTimeZone();
       await widget.api.saveSubscription({
-        'name': name.text.trim(),
+        'name': service?.name ?? name.text.trim(),
         'plan_name': plan.text.trim().isEmpty ? null : plan.text.trim(),
         'category': category.text.trim().isEmpty
             ? null
             : category.text.trim().toLowerCase(),
         'amount': amount.text.trim().replaceAll(',', '.'),
-        'currency': 'RUB',
+        'currency': currency,
         'period': period,
-        'next_charge_date': DateFormat('yyyy-MM-dd').format(nextDate),
+        'next_charge_date': isoDay(nextDate!),
         'anchor_day': anchorDay,
         'timezone': tz.local.name,
         'status': status,
+        'source': initial?['source'] ?? 'manual',
+        'bank_name': bank.text.trim().isEmpty ? null : bank.text.trim(),
+        if (initial?['last_payment_date'] != null)
+          'last_payment_date': initial!['last_payment_date'],
       }, id: widget.existing?['id']?.toString());
       if (mounted) Navigator.pop(context);
     } catch (e) {
@@ -1211,143 +1366,246 @@ class _SubscriptionFormState extends State<SubscriptionForm> {
     }
   }
 
+  void updateService(String value) {
+    final matched = widget.api.services.lookup(value);
+    if (category.text.trim().isEmpty || category.text == service?.category) {
+      category.text = matched?.category ?? '';
+    }
+    setState(() => service = matched);
+  }
+
+  void updatePeriod(String? value) {
+    setState(() {
+      period = value;
+      final paid = DateTime.tryParse(
+        initial?['last_payment_date']?.toString() ?? '',
+      );
+      if (!datePicked &&
+          value != null &&
+          paid != null &&
+          (nextDate == null || widget.draft?['source'] == 'statement')) {
+        anchorDay = paid.day;
+        final first = advanceCharge(paid, value, anchorDay);
+        nextDate = status == 'active'
+            ? upcomingCharge(first, value, anchorDay, DateTime.now())
+            : first;
+      }
+    });
+  }
+
   @override
-  Widget build(BuildContext context) => Padding(
-    padding: EdgeInsets.fromLTRB(
-      20,
-      8,
-      20,
-      MediaQuery.viewInsetsOf(context).bottom + 20,
-    ),
-    child: SingleChildScrollView(
-      child: Form(
-        key: formKey,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Text(
-              widget.existing == null
-                  ? 'Новая подписка'
-                  : 'Редактировать подписку',
-              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 18),
-            TextFormField(
-              controller: name,
-              hintLocales: const [Locale('ru'), Locale('en')],
-              decoration: const InputDecoration(labelText: 'Сервис'),
-              validator: (v) =>
-                  v == null || v.trim().isEmpty ? 'Укажите сервис' : null,
-            ),
-            const SizedBox(height: 10),
-            TextFormField(
-              controller: plan,
-              hintLocales: const [Locale('ru'), Locale('en')],
-              decoration: const InputDecoration(
-                labelText: 'Тариф (необязательно)',
-              ),
-            ),
-            const SizedBox(height: 10),
-            TextFormField(
-              controller: category,
-              hintLocales: const [Locale('ru'), Locale('en')],
-              decoration: const InputDecoration(
-                labelText: 'Категория, например музыка',
-              ),
-            ),
-            const SizedBox(height: 10),
-            TextFormField(
-              controller: amount,
-              decoration: const InputDecoration(labelText: 'Цена, ₽'),
-              keyboardType: const TextInputType.numberWithOptions(
-                decimal: true,
-              ),
-              inputFormatters: [PriceInputFormatter()],
-              validator: validatePrice,
-            ),
-            const SizedBox(height: 10),
-            DropdownButtonFormField<String>(
-              initialValue: period,
-              decoration: const InputDecoration(labelText: 'Период'),
-              items: const [
-                DropdownMenuItem(value: 'weekly', child: Text('Каждую неделю')),
-                DropdownMenuItem(value: 'monthly', child: Text('Каждый месяц')),
-                DropdownMenuItem(
-                  value: 'quarterly',
-                  child: Text('Каждые 3 месяца'),
+  Widget build(BuildContext context) {
+    final query = normalizedService(name.text);
+    final suggestions = query.isEmpty || service != null
+        ? const <SubscriptionService>[]
+        : widget.api.services.services
+              .where((s) => s.terms.any((term) => term.startsWith(query)))
+              .take(5);
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        20,
+        8,
+        20,
+        MediaQuery.viewInsetsOf(context).bottom + 20,
+      ),
+      child: SingleChildScrollView(
+        child: Form(
+          key: formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                widget.existing == null
+                    ? widget.draft == null
+                          ? 'Новая подписка'
+                          : 'Проверьте подписку'
+                    : 'Редактировать подписку',
+                style: const TextStyle(
+                  fontSize: 22,
+                  fontWeight: FontWeight.bold,
                 ),
-                DropdownMenuItem(value: 'yearly', child: Text('Каждый год')),
-              ],
-              onChanged: (v) => setState(() => period = v!),
-            ),
-            const SizedBox(height: 10),
-            ListTile(
-              tileColor: surface,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(16),
               ),
-              title: const Text('Следующее списание'),
-              subtitle: Text(DateFormat('d MMMM yyyy', 'ru').format(nextDate)),
-              trailing: const Icon(Icons.event),
-              onTap: () async {
-                final d = await showDatePicker(
-                  context: context,
-                  initialDate: nextDate,
-                  firstDate: DateTime(2020),
-                  lastDate: DateTime(2100),
-                );
-                if (d != null) {
-                  setState(() {
-                    nextDate = d;
-                    anchorDay = d.day;
-                  });
-                }
-              },
-            ),
-            if (widget.existing != null) ...[
+              const SizedBox(height: 18),
+              TextFormField(
+                controller: name,
+                hintLocales: const [Locale('ru'), Locale('en')],
+                maxLength: 120,
+                decoration: InputDecoration(
+                  labelText: 'Сервис',
+                  counterText: '',
+                  prefixIcon: service == null
+                      ? null
+                      : Icon(serviceIcon(service!.icon)),
+                ),
+                onChanged: updateService,
+                validator: (v) =>
+                    v == null || v.trim().isEmpty ? 'Укажите сервис' : null,
+              ),
+              if (suggestions.isNotEmpty)
+                Wrap(
+                  spacing: 6,
+                  children: [
+                    for (final suggestion in suggestions)
+                      ActionChip(
+                        avatar: Icon(serviceIcon(suggestion.icon), size: 18),
+                        label: Text(suggestion.name),
+                        onPressed: () {
+                          name.text = suggestion.name;
+                          updateService(suggestion.name);
+                        },
+                      ),
+                  ],
+                ),
+              const SizedBox(height: 10),
+              TextFormField(
+                controller: plan,
+                maxLength: 120,
+                hintLocales: const [Locale('ru'), Locale('en')],
+                decoration: const InputDecoration(
+                  labelText: 'Тариф (необязательно)',
+                  counterText: '',
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextFormField(
+                controller: category,
+                maxLength: 80,
+                hintLocales: const [Locale('ru'), Locale('en')],
+                decoration: const InputDecoration(
+                  labelText: 'Категория, например музыка',
+                  counterText: '',
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextFormField(
+                controller: amount,
+                decoration: InputDecoration(
+                  labelText: 'Цена',
+                  suffixIcon: DropdownButton<String>(
+                    value: currency,
+                    padding: const EdgeInsets.only(right: 12),
+                    items: [
+                      for (final code in {'RUB', 'USD', 'EUR', currency})
+                        DropdownMenuItem(value: code, child: Text(code)),
+                    ],
+                    onChanged: (value) => setState(() => currency = value!),
+                  ),
+                ),
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
+                ),
+                inputFormatters: [PriceInputFormatter()],
+                validator: validatePrice,
+              ),
               const SizedBox(height: 10),
               DropdownButtonFormField<String>(
-                initialValue: status,
-                decoration: const InputDecoration(labelText: 'Статус'),
-                items: const [
-                  DropdownMenuItem(value: 'active', child: Text('Активна')),
-                  DropdownMenuItem(
-                    value: 'paused',
-                    child: Text('Приостановлена'),
-                  ),
-                  DropdownMenuItem(value: 'cancelled', child: Text('Отменена')),
+                initialValue: period,
+                decoration: const InputDecoration(labelText: 'Период'),
+                items: [
+                  for (final entry in recurringPeriods.entries)
+                    DropdownMenuItem(
+                      value: entry.key,
+                      child: Text(entry.value),
+                    ),
                 ],
-                onChanged: (v) => setState(() => status = v!),
+                validator: (value) => value == null ? 'Выберите период' : null,
+                onChanged: updatePeriod,
               ),
-            ],
-            const SizedBox(height: 20),
-            FilledButton(
-              onPressed: busy ? null : save,
-              child: Text(busy ? 'Сохраняем…' : 'Сохранить'),
-            ),
-            if (widget.existing != null)
-              TextButton(
-                onPressed: busy
-                    ? null
-                    : () async {
-                        try {
-                          await widget.api.removeSubscription(
-                            widget.existing!['id'].toString(),
-                          );
-                          if (context.mounted) Navigator.pop(context);
-                        } catch (e) {
-                          if (context.mounted) errorSnack(context, e);
-                        }
-                      },
-                child: const Text(
-                  'Удалить',
-                  style: TextStyle(color: Colors.redAccent),
+              const SizedBox(height: 10),
+              TextFormField(
+                controller: bank,
+                maxLength: 80,
+                decoration: const InputDecoration(
+                  labelText: 'Банк (необязательно)',
+                  counterText: '',
                 ),
               ),
-          ],
+              const SizedBox(height: 10),
+              ListTile(
+                tileColor: surface,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                title: const Text('Следующее списание'),
+                subtitle: Text(
+                  nextDate == null
+                      ? 'Выберите дату'
+                      : DateFormat('d MMMM yyyy', 'ru').format(nextDate!),
+                ),
+                trailing: const Icon(Icons.event),
+                onTap: () async {
+                  final d = await showDatePicker(
+                    context: context,
+                    initialDate: nextDate ?? DateTime.now(),
+                    firstDate: DateTime(2000),
+                    lastDate: DateTime(2200),
+                  );
+                  if (d != null) {
+                    setState(() {
+                      nextDate = d;
+                      anchorDay = d.day;
+                      datePicked = true;
+                    });
+                  }
+                },
+              ),
+              if (initial != null) ...[
+                const SizedBox(height: 10),
+                DropdownButtonFormField<String>(
+                  initialValue: status,
+                  decoration: const InputDecoration(labelText: 'Статус'),
+                  items: const [
+                    DropdownMenuItem(value: 'active', child: Text('Активна')),
+                    DropdownMenuItem(
+                      value: 'paused',
+                      child: Text('Приостановлена'),
+                    ),
+                    DropdownMenuItem(
+                      value: 'cancelled',
+                      child: Text('Отменена'),
+                    ),
+                  ],
+                  onChanged: (v) => setState(() => status = v!),
+                ),
+              ],
+              const SizedBox(height: 20),
+              FilledButton(
+                onPressed: busy ? null : save,
+                child: Text(busy ? 'Сохраняем…' : 'Сохранить'),
+              ),
+              if (widget.existing != null)
+                TextButton(
+                  onPressed: busy
+                      ? null
+                      : () async {
+                          try {
+                            await widget.api.removeSubscription(
+                              widget.existing!['id'].toString(),
+                            );
+                            if (context.mounted) Navigator.pop(context);
+                          } catch (e) {
+                            if (context.mounted) errorSnack(context, e);
+                          }
+                        },
+                  child: const Text(
+                    'Удалить',
+                    style: TextStyle(color: Colors.redAccent),
+                  ),
+                ),
+            ],
+          ),
         ),
       ),
-    ),
-  );
+    );
+  }
 }
+
+IconData serviceIcon(String key) => switch (key) {
+  'music' => Icons.music_note,
+  'movie' => Icons.movie_outlined,
+  'book' => Icons.menu_book,
+  'telegram' => Icons.send,
+  'prime' => Icons.stars_outlined,
+  _ => Icons.subscriptions_outlined,
+};

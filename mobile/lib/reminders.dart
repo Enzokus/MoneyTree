@@ -1,11 +1,12 @@
 import 'dart:convert';
-import 'dart:math';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter_timezone/flutter_timezone.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:timezone/data/latest_all.dart' as tzdata;
 import 'package:timezone/timezone.dart' as tz;
+
+import 'subscription_intake.dart';
 
 class ReminderService {
   ReminderService._();
@@ -50,14 +51,6 @@ class ReminderService {
         false;
   }
 
-  DateTime advance(DateTime d, String period, int anchorDay) {
-    if (period == 'weekly') return d.add(const Duration(days: 7));
-    final months = {'monthly': 1, 'quarterly': 3, 'yearly': 12}[period] ?? 1;
-    final firstNext = DateTime(d.year, d.month + months, 1);
-    final lastDay = DateTime(firstNext.year, firstNext.month + 1, 0).day;
-    return DateTime(firstNext.year, firstNext.month, min(anchorDay, lastDay));
-  }
-
   Future<void> sync(
     List<Map<String, dynamic>> subscriptions,
     Map<String, dynamic>? profile,
@@ -74,7 +67,15 @@ class ReminderService {
       final date = DateTime.tryParse(sub['next_charge_date']?.toString() ?? '');
       if (date == null) continue;
       final location = tz.local;
-      var charge = date;
+      final period = sub['period']?.toString() ?? 'monthly';
+      final anchor = (sub['anchor_day'] as num?)?.toInt() ?? date.day;
+      var charge = upcomingCharge(
+        date,
+        period,
+        anchor,
+        tz.TZDateTime.now(location),
+      );
+      final scheduledDays = <String>{};
       for (var cycle = 0; cycle < 3 && count < 60; cycle++) {
         for (final day in days) {
           final remindDate = charge.subtract(Duration(days: day));
@@ -87,6 +88,9 @@ class ReminderService {
             minute,
           );
           if (!at.isAfter(tz.TZDateTime.now(location)) || count >= 60) continue;
+          if (period == 'daily' && !scheduledDays.add(isoDay(remindDate))) {
+            continue;
+          }
           final key = '${sub['id']}:$cycle:$day';
           final id =
               sha256
@@ -117,11 +121,7 @@ class ReminderService {
           );
           count++;
         }
-        charge = advance(
-          charge,
-          sub['period']?.toString() ?? 'monthly',
-          (sub['anchor_day'] as num?)?.toInt() ?? date.day,
-        );
+        charge = advanceCharge(charge, period, anchor);
       }
     }
   }

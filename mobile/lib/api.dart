@@ -11,6 +11,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:timezone/timezone.dart' as tz;
 
 import 'reminders.dart';
+import 'bank_statements.dart';
+import 'subscription_intake.dart';
 
 const apiBaseUrl = String.fromEnvironment(
   'API_BASE_URL',
@@ -66,6 +68,54 @@ class ApiClient extends ChangeNotifier {
 
   int _revision = 0;
   List<Map<String, dynamic>> _pending = [];
+  Map<StatementBank, DateTime> _statementDates = {};
+  Map<String, StatementPayment> _statementPayments = {};
+  Set<String> _statementFiles = {};
+
+  Map<StatementBank, DateTime> get statementDates =>
+      Map.unmodifiable(_statementDates);
+  Iterable<StatementPayment> get statementPayments => _statementPayments.values;
+  bool importedStatement(String fingerprint) =>
+      _statementFiles.contains(fingerprint);
+
+  ServiceDirectory get services => ServiceDirectory(
+    _rows(profile?['services'] ?? []).map(SubscriptionService.new).toList(),
+  );
+
+  Future<void> addStatement(BankStatement statement) async {
+    if (importedStatement(statement.fingerprint)) return;
+    final oldDate = _statementDates[statement.bank];
+    final dates = {
+      ..._statementDates,
+      if (oldDate == null || statement.coveredThrough.isAfter(oldDate))
+        statement.bank: statement.coveredThrough,
+    };
+    final payments = {..._statementPayments};
+    for (final payment in statement.payments) {
+      payments.putIfAbsent(payment.key, () => payment);
+    }
+    payments.removeWhere(
+      (_, p) => dates[p.bank]!.difference(p.date).inDays > 550,
+    );
+    final files = {..._statementFiles, statement.fingerprint};
+    if (files.length > 128) files.remove(files.first);
+    final previousDates = _statementDates;
+    final previousPayments = _statementPayments;
+    final previousFiles = _statementFiles;
+    _statementDates = dates;
+    _statementPayments = payments;
+    _statementFiles = files;
+    try {
+      await _persist();
+    } catch (_) {
+      _statementDates = previousDates;
+      _statementPayments = previousPayments;
+      _statementFiles = previousFiles;
+      rethrow;
+    }
+    notifyListeners();
+  }
+
   String? _accountId(String? token) {
     try {
       final payload = jsonDecode(
@@ -108,6 +158,14 @@ class ApiClient extends ChangeNotifier {
         'recommendations': recommendations,
         'profile': profile,
         'pending': _pending,
+        'statement_dates': {
+          for (final entry in _statementDates.entries)
+            entry.key.name: isoDay(entry.value),
+        },
+        'statement_payments': _statementPayments.values
+            .map((p) => p.toJson())
+            .toList(),
+        'statement_files': _statementFiles.toList(),
       }),
     );
     if (!ok) {
@@ -125,6 +183,9 @@ class ApiClient extends ChangeNotifier {
       recommendations = [];
       profile = null;
       _pending = [];
+      _statementDates = {};
+      _statementPayments = {};
+      _statementFiles = {};
       return;
     }
     final data = jsonDecode(raw) as Map<String, dynamic>;
@@ -135,6 +196,19 @@ class ApiClient extends ChangeNotifier {
         ? null
         : Map<String, dynamic>.from(data['profile']);
     _pending = _rows(data['pending'] ?? []);
+    _statementDates = {
+      for (final entry in (data['statement_dates'] as Map? ?? {}).entries)
+        StatementBank.values.byName(entry.key as String): calendarDay(
+          DateTime.parse(entry.value as String),
+        ),
+    };
+    _statementPayments = {
+      for (final payment in (data['statement_payments'] as List? ?? []).map(
+        (p) => StatementPayment.fromJson(p as List),
+      ))
+        payment.key: payment,
+    };
+    _statementFiles = Set<String>.from(data['statement_files'] as List? ?? []);
   }
 
   Future<void> _syncReminders() async {
@@ -341,6 +415,7 @@ class ApiClient extends ChangeNotifier {
     if (response.statusCode >= 400) {
       throw ApiException(
         'Ошибка ${response.statusCode}: ${utf8.decode(response.bodyBytes)}',
+        statusCode: response.statusCode,
       );
     }
     return response;
@@ -402,20 +477,41 @@ class ApiClient extends ChangeNotifier {
     _reloading = true;
     try {
       for (final op in List<Map<String, dynamic>>.from(_pending)) {
+        if (!_pending.contains(op)) continue;
         if (op['kind'] == 'save') {
           if (op['create'] == true) {
-            await post('/subscriptions', {
+            final saved = await post('/subscriptions', {
               ...Map<String, dynamic>.from(op['value']),
               'id': op['id'],
             });
+            if (saved is Map &&
+                saved['id'] != null &&
+                saved['id'] != op['id']) {
+              _pending.removeWhere((item) => item['id'] == op['id']);
+              subscriptions = [
+                ...subscriptions.where(
+                  (s) => s['id'] != op['id'] && s['id'] != saved['id'],
+                ),
+                Map<String, dynamic>.from(saved),
+              ];
+            }
           } else {
-            await put('/subscriptions/${op['id']}', op['value']);
+            try {
+              await put('/subscriptions/${op['id']}', op['value']);
+            } on ApiException catch (error) {
+              if (error.statusCode != 409) rethrow;
+              final serverRows = _rows(await get('/subscriptions'));
+              subscriptions = [
+                ...subscriptions.where((s) => s['id'] != op['id']),
+                ...serverRows.where((s) => s['id'] == op['id']),
+              ];
+            }
           }
         } else if (op['kind'] == 'delete') {
           try {
             await delete('/subscriptions/${op['id']}');
           } on ApiException catch (error) {
-            if (!error.message.startsWith('Ошибка 404:')) rethrow;
+            if (error.statusCode != 404) rethrow;
           }
         } else if (op['kind'] == 'reminders') {
           await put('/me/reminders', op['value']);
@@ -458,10 +554,20 @@ class ApiClient extends ChangeNotifier {
       throw const ApiException('Дождитесь завершения входа.');
     }
     final key = id ?? _uuid();
+    final directory = services;
+    final original = subscriptions.where((s) => s['id'] == id).firstOrNull;
+    if (subscriptions.any(
+      (s) =>
+          s['id'] != key &&
+          directory.sameSubscription(s, value) &&
+          (original == null || !directory.sameSubscription(s, original)),
+    )) {
+      throw const ApiException('Такая подписка уже есть в списке.');
+    }
     final row = {
       ...value,
       'id': key,
-      'source': 'manual',
+      'source': value['source'] ?? original?['source'] ?? 'manual',
       'anchor_day':
           value['anchor_day'] ?? DateTime.parse(value['next_charge_date']).day,
     };
@@ -541,6 +647,9 @@ class ApiClient extends ChangeNotifier {
     recommendations = [];
     catalog = [];
     _pending = [];
+    _statementDates = {};
+    _statementPayments = {};
+    _statementFiles = {};
     await _storage.delete(key: 'access');
     await _storage.delete(key: 'refresh');
     final prefs = await SharedPreferences.getInstance();

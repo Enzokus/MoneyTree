@@ -202,3 +202,29 @@ def test_offline_create_retries_do_not_duplicate_subscriptions():
     rows = client.get('/subscriptions', headers=auth).json()
     assert sum(row['id'] == identifier for row in rows) == 1
     client.delete('/subscriptions/' + identifier, headers=auth)
+
+
+def test_subscription_intake_keeps_selected_metadata_and_reuses_duplicates():
+    auth = headers(login())
+    services = client.get('/me', headers=auth).json()['services']
+    assert any(s['name'] == 'Яндекс Плюс' and s['icon'] == 'music' for s in services)
+    payload = {'name': 'Yandex Plus', 'plan_name': 'intake test', 'amount': '99',
+               'period': 'daily', 'next_charge_date': '2099-03-29', 'source': 'statement',
+               'bank_name': 'Сбербанк', 'last_payment_date': '2099-03-28'}
+    first = client.post('/subscriptions', json=payload, headers=auth)
+    assert first.status_code == 201
+    row = first.json()
+    try:
+        assert row['source'] == 'statement'
+        assert row['bank_name'] == 'Сбербанк'
+        assert row['last_payment_date'] == '2099-03-28'
+        assert row['period'] == 'daily'
+        duplicate = client.post('/subscriptions', headers=auth,
+                                json={**payload, 'name': 'Яндекс Плюс', 'source': 'manual'})
+        assert duplicate.json()['id'] == row['id']
+        edited = client.put('/subscriptions/' + row['id'], headers=auth,
+                            json={k: v for k, v in payload.items() if k not in ('bank_name', 'last_payment_date')})
+        assert edited.json()['last_payment_date'] == '2099-03-28'
+        assert edited.json()['source'] == 'statement'
+    finally:
+        client.delete('/subscriptions/' + row['id'], headers=auth)

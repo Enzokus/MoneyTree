@@ -6,6 +6,8 @@ MONTHS = {'monthly': 1, 'quarterly': 3, 'yearly': 12}
 
 
 def advance(d: date, period: str, anchor_day: int | None = None) -> date:
+    if period == 'daily':
+        return d + timedelta(days=1)
     if period == 'weekly':
         return d + timedelta(days=7)
     months = MONTHS[period]
@@ -15,6 +17,8 @@ def advance(d: date, period: str, anchor_day: int | None = None) -> date:
 
 
 def upcoming(d: date, period: str, today: date, anchor_day: int | None = None) -> date:
+    if period == 'daily':
+        return max(d, today)
     anchor_day = anchor_day or d.day
     while d < today:
         d = advance(d, period, anchor_day)
@@ -22,5 +26,5 @@ def upcoming(d: date, period: str, today: date, anchor_day: int | None = None) -
 
 
 def monthly_equivalent(amount: Decimal, period: str) -> Decimal:
-    factor = {'weekly': Decimal(52) / 12, 'monthly': Decimal(1), 'quarterly': Decimal(1) / 3, 'yearly': Decimal(1) / 12}[period]
+    factor = {'daily': Decimal(365) / 12, 'weekly': Decimal(52) / 12, 'monthly': Decimal(1), 'quarterly': Decimal(1) / 3, 'yearly': Decimal(1) / 12}[period]
     return (amount * factor).quantize(Decimal('0.01'))

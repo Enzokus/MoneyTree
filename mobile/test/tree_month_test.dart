@@ -54,6 +54,34 @@ void main() {
     expect(subscriptionsThisMonth([row], now: DateTime(2028, 2, 10)), [row]);
   });
 
+  testWidgets('Subscriptions combine status and text search in Russian', (
+    tester,
+  ) async {
+    final api = ApiClient();
+    addTearDown(api.dispose);
+    api.subscriptions = [
+      subscription('Музыка', DateTime.now(), status: 'paused'),
+      subscription('Видео', DateTime.now(), status: 'paused'),
+      subscription('Музыка 2', DateTime.now(), status: 'cancelled'),
+    ];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: SubscriptionsPage(api: api)),
+      ),
+    );
+    expect(find.textContaining('paused'), findsNothing);
+    expect(find.textContaining('Отменена'), findsOneWidget);
+    await tester.tap(find.text('Все'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Приостановленные').last);
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), 'музыка');
+    await tester.pumpAndSettle();
+    expect(find.text('Музыка'), findsOneWidget);
+    expect(find.text('Видео'), findsNothing);
+    expect(find.text('Музыка 2'), findsNothing);
+  });
+
   testWidgets('Tree totals and lists the same subscriptions in date order', (
     tester,
   ) async {

@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:subscription_tree/api.dart';
+import 'package:subscription_tree/bank_statements.dart';
 
 final subscription = <String, dynamic>{
   'name': 'Music',
@@ -25,6 +26,56 @@ void main() {
   setUp(() {
     SharedPreferences.setMockInitialValues({});
     FlutterSecureStorage.setMockInitialValues({});
+  });
+
+  test('Progress and overlapping statement rows persist locally without network payloads', () async {
+    FlutterSecureStorage.setMockInitialValues({
+      'access': access('alice'),
+      'refresh': 'refresh',
+    });
+    final requests = <http.Request>[];
+    final client = MockClient((request) async {
+      requests.add(request);
+      throw http.ClientException('offline');
+    });
+    final api = ApiClient(client: client);
+    await api.init();
+    await settle();
+    final payment = StatementPayment(
+      'test-row',
+      StatementBank.sber,
+      DateTime.utc(2026, 4, 15),
+      'Test',
+      100,
+      'RUB',
+    );
+    await api.addStatement(
+      BankStatement(StatementBank.sber, DateTime.utc(2026, 4, 16), 'pdf-1', [
+        payment,
+      ]),
+    );
+    await api.addStatement(
+      BankStatement(StatementBank.sber, DateTime.utc(2026, 4, 17), 'pdf-2', [
+        payment,
+      ]),
+    );
+    await api.addStatement(
+      BankStatement(StatementBank.sber, DateTime.utc(2026, 4, 12), 'old', []),
+    );
+    expect(requests.every((request) => request.method == 'GET'), isTrue);
+    api.dispose();
+
+    final restored = ApiClient(
+      client: MockClient((_) async => throw http.ClientException('offline')),
+    );
+    addTearDown(restored.dispose);
+    await restored.init();
+    expect(restored.importedStatement('pdf-1'), isTrue);
+    expect(restored.statementPayments.single.key, payment.key);
+    expect(
+      restored.statementDates[StatementBank.sber],
+      DateTime.utc(2026, 4, 17),
+    );
   });
 
   test(

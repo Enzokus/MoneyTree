@@ -10,21 +10,23 @@ import httpx
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from .billing import monthly_equivalent, upcoming
 from .config import settings
 from .db import Base, engine, get_db
-from .models import CatalogPlan, PasswordLogin, RefreshSession, Subscription, User
+from .models import CatalogPlan, PasswordLogin, RefreshSession, Service, Subscription, SubscriptionDetails, User
 from .passwords import DEV_USER_ID, normalize_ru_phone, seed_dev_account, verify_password
 from .registration import complete_registration, start_registration
 from .schemas import (AskInput, PasswordLoginInput, RegistrationComplete, RegistrationStart,
                       ReminderSettings, SubscriptionCreate, SubscriptionInput, SubscriptionOut)
+from .services import same_subscription, seed_services, service_aliases, service_payload
 
 if len(settings.jwt_secret) < 32 or settings.jwt_secret.startswith('replace_with_'):
     raise RuntimeError('JWT_SECRET must contain at least 32 characters')
 Base.metadata.create_all(engine)
+seed_services()
 if settings.allow_dev_auth:
     seed_dev_account()
 app = FastAPI(title='Subscription Tree API', version='0.1.0')
@@ -162,8 +164,9 @@ def logout_all(user: CurrentUser, db: Db):
 
 
 @app.get('/me')
-def me(user: CurrentUser):
+def me(user: CurrentUser, db: Db):
     return {'id': user.id, 'display_name': user.display_name, 'email': user.email,
+            'services': [service_payload(s) for s in db.scalars(select(Service).order_by(Service.name))],
             'reminders': {'hour': user.reminder_hour, 'minute': user.reminder_minute,
                           'days_before': [int(x) for x in user.reminder_days.split(',') if x]}}
 
@@ -181,6 +184,10 @@ def reminders(body: ReminderSettings, user: CurrentUser, db: Db):
 
 def subscription_payload(s: Subscription, device_timezone: str | None = None):
     payload = SubscriptionOut.model_validate(s).model_dump(mode='json')
+    if s.details:
+        payload['bank_name'] = s.details.bank_name
+        if s.details.last_payment_date:
+            payload['last_payment_date'] = s.details.last_payment_date.isoformat()
     try:
         local_today = datetime.now(ZoneInfo(device_timezone or s.timezone)).date()
     except Exception:
@@ -202,7 +209,8 @@ def list_subscriptions(user: CurrentUser, db: Db, timezone: str | None = None):
 
 @app.post('/subscriptions', status_code=201)
 def create_subscription(body: SubscriptionCreate, user: CurrentUser, db: Db):
-    data = body.model_dump(exclude={'id'})
+    rows = locked_subscriptions(db, user)
+    data = body.model_dump(exclude={'id', 'bank_name', 'last_payment_date'})
     if body.id is not None:
         existing = db.get(Subscription, str(body.id))
         if existing:
@@ -210,8 +218,13 @@ def create_subscription(body: SubscriptionCreate, user: CurrentUser, db: Db):
                 raise HTTPException(409, 'Subscription ID already exists')
             return subscription_payload(existing)
         data['id'] = str(body.id)
+    aliases = service_aliases(db)
+    for existing in rows:
+        if same_subscription(existing, body, aliases):
+            return subscription_payload(existing)
     data['anchor_day'] = body.anchor_day or body.next_charge_date.day
     s = Subscription(user_id=user.id, **data)
+    update_subscription_details(s, body)
     db.add(s)
     db.commit()
     db.refresh(s)
@@ -225,13 +238,34 @@ def owned_subscription(db: Session, user: User, subscription_id: str) -> Subscri
     return s
 
 
+def locked_subscriptions(db: Session, user: User):
+    # Serialize identity checks and writes for a user on both SQLite and PostgreSQL.
+    db.execute(update(User).where(User.id == user.id).values(id=User.id))
+    return db.scalars(select(Subscription).where(Subscription.user_id == user.id)).all()
+
+
+def update_subscription_details(s: Subscription, body: SubscriptionInput):
+    if not s.details and (body.bank_name or body.last_payment_date):
+        s.details = SubscriptionDetails()
+    if s.details:
+        for field in ('bank_name', 'last_payment_date'):
+            if field in body.model_fields_set:
+                setattr(s.details, field, getattr(body, field))
+
+
 @app.put('/subscriptions/{subscription_id}')
 def update_subscription(subscription_id: str, body: SubscriptionInput, user: CurrentUser, db: Db):
+    rows = locked_subscriptions(db, user)
     s = owned_subscription(db, user, subscription_id)
-    data = body.model_dump()
+    aliases = service_aliases(db)
+    for other in rows:
+        if other.id != s.id and same_subscription(other, body, aliases) and not same_subscription(other, s, aliases):
+            raise HTTPException(409, 'Subscription already exists')
+    data = body.model_dump(exclude={'bank_name', 'last_payment_date'})
     data['anchor_day'] = body.anchor_day or body.next_charge_date.day
     for key, value in data.items():
         setattr(s, key, value)
+    update_subscription_details(s, body)
     db.commit()
     return subscription_payload(s)
 

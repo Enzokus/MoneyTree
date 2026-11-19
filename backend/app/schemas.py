@@ -5,8 +5,9 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
-Period = Literal['weekly', 'monthly', 'quarterly', 'yearly']
+Period = Literal['daily', 'weekly', 'monthly', 'quarterly', 'yearly']
 Status = Literal['active', 'paused', 'cancelled']
+Source = Literal['manual', 'statement', 'shared']
 
 
 class PasswordLoginInput(BaseModel):
@@ -35,10 +36,13 @@ class SubscriptionInput(BaseModel):
     anchor_day: int | None = Field(default=None, ge=1, le=31)
     timezone: str = 'Europe/Moscow'
     status: Status = 'active'
+    bank_name: str | None = Field(default=None, max_length=80)
+    last_payment_date: date | None = None
 
 
 class SubscriptionCreate(SubscriptionInput):
     id: UUID | None = None
+    source: Source = 'manual'
 
 
 class SubscriptionOut(SubscriptionInput):
