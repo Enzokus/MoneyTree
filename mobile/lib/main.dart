@@ -187,12 +187,10 @@ class _LoginPageState extends State<LoginPage> {
   final _phone = TextEditingController();
   final _email = TextEditingController();
   final _password = TextEditingController();
-  final _code = TextEditingController();
   bool _byPhone = true;
   bool _busy = false;
   bool _showPassword = false;
   bool _registering = false;
-  String? _challengeId;
 
   String get _identifier => _byPhone ? '+7${_phone.text}' : _email.text.trim();
 
@@ -201,42 +199,20 @@ class _LoginPageState extends State<LoginPage> {
     _phone.dispose();
     _email.dispose();
     _password.dispose();
-    _code.dispose();
     super.dispose();
   }
 
   Future<void> _enter() async {
     if (_busy || !_formKey.currentState!.validate()) return;
-    await _run(() async {
-      final challengeId = _challengeId;
-      if (!_registering) {
-        await widget.api.loginWithPassword(_identifier, _password.text);
-        if (mounted && widget.reauthenticate) Navigator.of(context).pop();
-      } else if (challengeId == null) {
-        await _requestCode();
-      } else {
-        await widget.api.completeRegistration(
-          challengeId,
-          _code.text,
-          _password.text,
-        );
-      }
-    });
-  }
-
-  Future<void> _requestCode() async {
-    final challengeId = await widget.api.requestRegistrationCode(_identifier);
-    if (!mounted) return;
-    _code.clear();
-    setState(() => _challengeId = challengeId);
-  }
-
-  Future<void> _run(Future<void> Function() action) async {
-    if (_busy) return;
     FocusScope.of(context).unfocus();
     setState(() => _busy = true);
     try {
-      await action();
+      if (_registering) {
+        await widget.api.register(_identifier, _password.text);
+      } else {
+        await widget.api.loginWithPassword(_identifier, _password.text);
+        if (mounted && widget.reauthenticate) Navigator.of(context).pop();
+      }
     } catch (e) {
       if (mounted) errorSnack(context, e);
     } finally {
@@ -246,10 +222,8 @@ class _LoginPageState extends State<LoginPage> {
 
   void _changeMode() {
     _password.clear();
-    _code.clear();
     setState(() {
       _registering = !_registering;
-      _challengeId = null;
       _showPassword = false;
     });
   }
@@ -288,143 +262,100 @@ class _LoginPageState extends State<LoginPage> {
                       ),
                     ),
                     const SizedBox(height: 28),
-                    if (_challengeId == null) ...[
-                      SegmentedButton<bool>(
-                        segments: const [
-                          ButtonSegment(value: true, label: Text('Телефон')),
-                          ButtonSegment(value: false, label: Text('Почта')),
-                        ],
-                        selected: {_byPhone},
-                        showSelectedIcon: false,
-                        onSelectionChanged: _busy
-                            ? null
-                            : (selection) =>
-                                  setState(() => _byPhone = selection.single),
-                      ),
-                      const SizedBox(height: 16),
-                      if (_byPhone)
-                        TextFormField(
-                          key: const ValueKey('login-phone'),
-                          controller: _phone,
-                          enabled: !_busy,
-                          keyboardType: TextInputType.phone,
-                          textInputAction: TextInputAction.next,
-                          inputFormatters: [RussianPhoneInputFormatter()],
-                          decoration: const InputDecoration(
-                            labelText: 'Номер телефона',
-                            prefixText: '+7 ',
-                          ),
-                          validator: (value) =>
-                              RegExp(r'^[0-9]{10}$').hasMatch(value ?? '')
-                              ? null
-                              : 'Введите 10 цифр номера',
-                        )
-                      else
-                        TextFormField(
-                          key: const ValueKey('login-email'),
-                          controller: _email,
-                          enabled: !_busy,
-                          keyboardType: TextInputType.emailAddress,
-                          autocorrect: false,
-                          textInputAction: TextInputAction.next,
-                          decoration: const InputDecoration(
-                            labelText: 'Электронная почта',
-                          ),
-                          validator: (value) =>
-                              RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
-                                  .hasMatch((value ?? '').trim())
-                              ? null
-                              : 'Введите адрес электронной почты',
-                        ),
-                      const SizedBox(height: 12),
+                    SegmentedButton<bool>(
+                      segments: const [
+                        ButtonSegment(value: true, label: Text('Телефон')),
+                        ButtonSegment(value: false, label: Text('Почта')),
+                      ],
+                      selected: {_byPhone},
+                      showSelectedIcon: false,
+                      onSelectionChanged: _busy
+                          ? null
+                          : (selection) =>
+                                setState(() => _byPhone = selection.single),
+                    ),
+                    const SizedBox(height: 16),
+                    if (_byPhone)
                       TextFormField(
-                        controller: _password,
+                        key: const ValueKey('login-phone'),
+                        controller: _phone,
                         enabled: !_busy,
-                        obscureText: !_showPassword,
-                        autocorrect: false,
-                        enableSuggestions: false,
-                        textInputAction: TextInputAction.done,
-                        onFieldSubmitted: (_) => _enter(),
-                        validator: (value) {
-                          final length = (value ?? '').runes.length;
-                          if (length == 0) return 'Введите пароль';
-                          if (_registering && (length < 12 || length > 256)) {
-                            return 'Пароль должен содержать от 12 до 256 символов';
-                          }
-                          return null;
-                        },
-                        decoration: InputDecoration(
-                          labelText: 'Пароль',
-                          helperText: _registering
-                              ? 'Минимум 12 символов'
-                              : null,
-                          suffixIcon: IconButton(
-                            tooltip: _showPassword
-                                ? 'Скрыть пароль'
-                                : 'Показать пароль',
-                            onPressed: () =>
-                                setState(() => _showPassword = !_showPassword),
-                            icon: Icon(
-                              _showPassword
-                                  ? Icons.visibility_off
-                                  : Icons.visibility,
-                            ),
-                          ),
-                        ),
-                      ),
-                    ] else ...[
-                      Text(
-                        _byPhone
-                            ? 'Отправили SMS с кодом на $_identifier'
-                            : 'Отправили письмо с кодом на $_identifier',
-                        textAlign: TextAlign.center,
-                      ),
-                      const SizedBox(height: 16),
-                      TextFormField(
-                        key: const ValueKey('registration-code'),
-                        controller: _code,
-                        enabled: !_busy,
-                        keyboardType: TextInputType.number,
-                        textInputAction: TextInputAction.done,
-                        autofillHints: const [AutofillHints.oneTimeCode],
-                        inputFormatters: [
-                          FilteringTextInputFormatter.digitsOnly,
-                          LengthLimitingTextInputFormatter(6),
-                        ],
+                        keyboardType: TextInputType.phone,
+                        textInputAction: TextInputAction.next,
+                        inputFormatters: [RussianPhoneInputFormatter()],
                         decoration: const InputDecoration(
-                          labelText: 'Код из 6 цифр',
+                          labelText: 'Номер телефона',
+                          prefixText: '+7 ',
                         ),
-                        onFieldSubmitted: (_) => _enter(),
-                        validator: (value) => (value ?? '').length == 6
+                        validator: (value) =>
+                            RegExp(r'^[0-9]{10}$').hasMatch(value ?? '')
                             ? null
-                            : 'Введите 6 цифр кода',
+                            : 'Введите 10 цифр номера',
+                      )
+                    else
+                      TextFormField(
+                        key: const ValueKey('login-email'),
+                        controller: _email,
+                        enabled: !_busy,
+                        keyboardType: TextInputType.emailAddress,
+                        autocorrect: false,
+                        textInputAction: TextInputAction.next,
+                        decoration: const InputDecoration(
+                          labelText: 'Электронная почта',
+                        ),
+                        validator: (value) =>
+                            RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
+                                .hasMatch((value ?? '').trim())
+                            ? null
+                            : 'Введите адрес электронной почты',
                       ),
-                    ],
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      controller: _password,
+                      enabled: !_busy,
+                      obscureText: !_showPassword,
+                      autocorrect: false,
+                      enableSuggestions: false,
+                      textInputAction: TextInputAction.done,
+                      onFieldSubmitted: (_) => _enter(),
+                      validator: (value) {
+                        final length = (value ?? '').runes.length;
+                        if (length == 0) return 'Введите пароль';
+                        if (_registering && (length < 12 || length > 256)) {
+                          return 'Пароль должен содержать от 12 до 256 символов';
+                        }
+                        return null;
+                      },
+                      decoration: InputDecoration(
+                        labelText: 'Пароль',
+                        helperText: _registering
+                            ? 'Минимум 12 символов'
+                            : null,
+                        suffixIcon: IconButton(
+                          tooltip: _showPassword
+                              ? 'Скрыть пароль'
+                              : 'Показать пароль',
+                          onPressed: () =>
+                              setState(() => _showPassword = !_showPassword),
+                          icon: Icon(
+                            _showPassword
+                                ? Icons.visibility_off
+                                : Icons.visibility,
+                          ),
+                        ),
+                      ),
+                    ),
                     const SizedBox(height: 20),
                     FilledButton(
                       onPressed: _busy ? null : _enter,
                       child: Text(
                         _busy
                             ? 'Подождите…'
-                            : !_registering
-                            ? 'Войти'
-                            : _challengeId == null
-                            ? 'Получить код'
-                            : 'Подтвердить и войти',
+                            : _registering
+                            ? 'Зарегистрироваться'
+                            : 'Войти',
                       ),
                     ),
-                    if (_challengeId != null) ...[
-                      TextButton(
-                        onPressed: _busy ? null : () => _run(_requestCode),
-                        child: const Text('Отправить код ещё раз'),
-                      ),
-                      TextButton(
-                        onPressed: _busy
-                            ? null
-                            : () => setState(() => _challengeId = null),
-                        child: const Text('Изменить данные'),
-                      ),
-                    ],
                     if (!_registering) ...[
                       const OutlinedButton(
                         onPressed: null,
@@ -436,7 +367,7 @@ class _LoginPageState extends State<LoginPage> {
                         style: TextStyle(color: Colors.white54),
                       ),
                     ],
-                    if (!widget.reauthenticate && _challengeId == null)
+                    if (!widget.reauthenticate)
                       TextButton(
                         onPressed: _busy ? null : _changeMode,
                         child: Text(
@@ -465,6 +396,42 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   int selected = 1;
+  bool _deletingAccount = false;
+
+  Future<void> _confirmAccountDeletion() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialog) => AlertDialog(
+        title: const Text('Удалить аккаунт?'),
+        content: const Text(
+          'Аккаунт и все его подписки будут удалены без возможности восстановления.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialog).pop(false),
+            child: const Text('Отмена'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(dialog).pop(true),
+            child: const Text(
+              'Удалить аккаунт',
+              style: TextStyle(color: Colors.redAccent),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || confirmed != true) return;
+    setState(() => _deletingAccount = true);
+    try {
+      await widget.api.deleteAccount();
+    } catch (error) {
+      if (mounted) errorSnack(context, error);
+    } finally {
+      if (mounted) setState(() => _deletingAccount = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final pages = [
@@ -491,6 +458,7 @@ class _HomePageState extends State<HomePage> {
             ),
           PopupMenuButton<String>(
             tooltip: 'Меню',
+            enabled: !_deletingAccount,
             onSelected: (choice) async {
               switch (choice) {
                 case 'manual':
@@ -520,6 +488,9 @@ class _HomePageState extends State<HomePage> {
                     if (context.mounted) errorSnack(context, error);
                   }
                   break;
+                case 'delete_account':
+                  await _confirmAccountDeletion();
+                  break;
               }
             },
             itemBuilder: (_) => [
@@ -541,7 +512,20 @@ class _HomePageState extends State<HomePage> {
               ),
               if (widget.api.needsSignIn)
                 const PopupMenuItem(value: 'login', child: Text('Войти снова')),
-              const PopupMenuItem(value: 'logout', child: Text('Выйти')),
+              const PopupMenuItem(
+                value: 'logout',
+                child: Text(
+                  'Выйти из аккаунта',
+                  style: TextStyle(color: Colors.redAccent),
+                ),
+              ),
+              const PopupMenuItem(
+                value: 'delete_account',
+                child: Text(
+                  'Удалить аккаунт',
+                  style: TextStyle(color: Colors.redAccent),
+                ),
+              ),
             ],
           ),
         ],

@@ -10,7 +10,7 @@ import httpx
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
 from .billing import monthly_equivalent, upcoming
@@ -18,8 +18,8 @@ from .config import settings
 from .db import Base, engine, get_db
 from .models import CatalogPlan, PasswordLogin, RefreshSession, Service, Subscription, SubscriptionDetails, User
 from .passwords import DEV_USER_ID, normalize_ru_phone, seed_dev_account, verify_password
-from .registration import complete_registration, start_registration
-from .schemas import (AskInput, PasswordLoginInput, RegistrationComplete, RegistrationStart,
+from .registration import register_user
+from .schemas import (AskInput, PasswordLoginInput, RegistrationInput,
                       ReminderSettings, SubscriptionCreate, SubscriptionInput, SubscriptionOut)
 from .services import same_subscription, seed_services, service_aliases, service_payload
 
@@ -43,7 +43,16 @@ class RefreshInput(BaseModel):
     refresh_token: str
 
 
+def lock_account(db: Session, user: User) -> None:
+    # Serialize writes with account deletion on SQLite and PostgreSQL.
+    with db.no_autoflush:
+        result = db.execute(update(User).where(User.id == user.id).values(id=User.id))
+    if result.rowcount != 1:
+        raise HTTPException(401, 'Unknown user')
+
+
 def token_pair(db: Session, user: User) -> dict:
+    lock_account(db, user)
     now = datetime.now(timezone.utc)
     raw = secrets.token_urlsafe(48)
     session = RefreshSession(user_id=user.id, token_hash=hashlib.sha256(raw.encode()).hexdigest(), expires_at=now + timedelta(days=30))
@@ -125,15 +134,10 @@ def password_login(body: PasswordLoginInput, request: Request, db: Db):
     return token_pair(db, user)
 
 
-@app.post('/auth/register/start')
-def registration_start(body: RegistrationStart, request: Request, db: Db):
+@app.post('/auth/register', status_code=201)
+def register(body: RegistrationInput, request: Request, db: Db):
     source = request.client.host if request.client else 'unknown'
-    return {'challenge_id': start_registration(db, body.identifier, source)}
-
-
-@app.post('/auth/register/complete', status_code=201)
-def registration_complete(body: RegistrationComplete, db: Db):
-    return token_pair(db, complete_registration(db, body))
+    return token_pair(db, register_user(db, body, source))
 
 
 @app.post('/auth/refresh')
@@ -143,6 +147,8 @@ def refresh(body: RefreshInput, db: Db):
         raise HTTPException(401, 'Invalid refresh token')
     record.revoked = True
     user = db.get(User, record.user_id)
+    if user is None:
+        raise HTTPException(401, 'Unknown user')
     return token_pair(db, user)
 
 
@@ -169,6 +175,16 @@ def me(user: CurrentUser, db: Db):
             'services': [service_payload(s) for s in db.scalars(select(Service).order_by(Service.name))],
             'reminders': {'hour': user.reminder_hour, 'minute': user.reminder_minute,
                           'days_before': [int(x) for x in user.reminder_days.split(',') if x]}}
+
+
+@app.delete('/me')
+def delete_account(user: CurrentUser, db: Db):
+    lock_account(db, user)
+    db.execute(delete(RefreshSession).where(RefreshSession.user_id == user.id))
+    db.execute(delete(PasswordLogin).where(PasswordLogin.user_id == user.id))
+    db.delete(user)
+    db.commit()
+    return {'ok': True}
 
 
 @app.put('/me/reminders')
@@ -239,8 +255,7 @@ def owned_subscription(db: Session, user: User, subscription_id: str) -> Subscri
 
 
 def locked_subscriptions(db: Session, user: User):
-    # Serialize identity checks and writes for a user on both SQLite and PostgreSQL.
-    db.execute(update(User).where(User.id == user.id).values(id=User.id))
+    lock_account(db, user)
     return db.scalars(select(Subscription).where(Subscription.user_id == user.id)).all()
 
 
@@ -272,6 +287,7 @@ def update_subscription(subscription_id: str, body: SubscriptionInput, user: Cur
 
 @app.delete('/subscriptions/{subscription_id}')
 def delete_subscription(subscription_id: str, user: CurrentUser, db: Db):
+    lock_account(db, user)
     db.delete(owned_subscription(db, user, subscription_id))
     db.commit()
     return {'ok': True}

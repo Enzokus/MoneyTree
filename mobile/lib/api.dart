@@ -43,7 +43,7 @@ class ApiClient extends ChangeNotifier {
     if (!_disposed) super.notifyListeners();
   }
 
-  bool _reloading = false;
+  Future<void>? _reloadInProgress;
   bool _authenticating = false;
   Future<void>? _refreshing;
   String get _deviceTimezone {
@@ -56,11 +56,12 @@ class ApiClient extends ChangeNotifier {
 
   Future<void> _renewTokens() => _refreshing ??= _performRefresh();
   Future<void> _performRefresh() async {
+    final refresh = _refresh;
     try {
       final tokens = await _rawPost("/auth/refresh", {
-        "refresh_token": _refresh,
+        "refresh_token": refresh,
       });
-      await _setTokens(tokens);
+      if (_refresh == refresh) await _setTokens(tokens);
     } finally {
       _refreshing = null;
     }
@@ -83,6 +84,9 @@ class ApiClient extends ChangeNotifier {
   );
 
   Future<void> addStatement(BankStatement statement) async {
+    if (_authenticating) {
+      throw const ApiException('Дождитесь завершения операции с аккаунтом.');
+    }
     if (importedStatement(statement.fingerprint)) return;
     final oldDate = _statementDates[statement.bank];
     final dates = {
@@ -258,21 +262,9 @@ class ApiClient extends ChangeNotifier {
     }),
   );
 
-  Future<String> requestRegistrationCode(String identifier) async {
-    final response = await _rawPost('/auth/register/start', {
+  Future<void> register(String identifier, String password) => _signIn(
+    () => _rawPost('/auth/register', {
       'identifier': identifier,
-    }, timeout: const Duration(seconds: 30));
-    return response['challenge_id'] as String;
-  }
-
-  Future<void> completeRegistration(
-    String challengeId,
-    String code,
-    String password,
-  ) => _signIn(
-    () => _rawPost('/auth/register/complete', {
-      'challenge_id': challengeId,
-      'code': code,
       'password': password,
     }),
   );
@@ -282,7 +274,7 @@ class ApiClient extends ChangeNotifier {
   Future<void> _signIn(
     Future<Map<String, dynamic>> Function() authenticate,
   ) async {
-    if (_reloading || _authenticating) {
+    if (_reloadInProgress != null || _authenticating) {
       throw const ApiException('Дождитесь завершения синхронизации или входа.');
     }
     _authenticating = true;
@@ -423,9 +415,8 @@ class ApiClient extends ChangeNotifier {
 
   Future<Map<String, dynamic>> _rawPost(
     String path,
-    Object body, {
-    Duration timeout = const Duration(seconds: 10),
-  }) async {
+    Object body,
+  ) async {
     try {
       final response = await _client
           .post(
@@ -433,16 +424,13 @@ class ApiClient extends ChangeNotifier {
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode(body),
           )
-          .timeout(timeout);
+          .timeout(const Duration(seconds: 10));
       if (response.statusCode >= 400) {
-        if (path.startsWith('/auth/register/')) {
+        if (path == '/auth/register') {
           final message = switch (response.statusCode) {
-            400 => 'Код неверный или больше не действует',
             409 => 'Этот телефон или почта уже зарегистрированы',
             422 => 'Проверьте данные для регистрации',
             429 => 'Слишком много запросов. Попробуйте позже',
-            502 => 'Не удалось отправить код. Попробуйте ещё раз',
-            503 => 'Отправка кодов этим способом пока недоступна',
             _ => 'Ошибка регистрации: ${response.statusCode}',
           };
           throw ApiException(message, statusCode: response.statusCode);
@@ -473,8 +461,14 @@ class ApiClient extends ChangeNotifier {
   Future<void> delete(String path) async => _request('DELETE', path);
 
   Future<void> reload() async {
-    if (!signedIn || needsSignIn || _reloading || _authenticating) return;
-    _reloading = true;
+    if (!signedIn || needsSignIn || _authenticating) return;
+    await (_reloadInProgress ??= _syncAccount().whenComplete(() {
+      _reloadInProgress = null;
+      notifyListeners();
+    }));
+  }
+
+  Future<void> _syncAccount() async {
     try {
       for (final op in List<Map<String, dynamic>>.from(_pending)) {
         if (!_pending.contains(op)) continue;
@@ -540,9 +534,6 @@ class ApiClient extends ChangeNotifier {
       await _syncReminders();
     } catch (_) {
       offline = true;
-    } finally {
-      _reloading = false;
-      notifyListeners();
     }
   }
 
@@ -551,7 +542,7 @@ class ApiClient extends ChangeNotifier {
     String? id,
   }) async {
     if (_authenticating) {
-      throw const ApiException('Дождитесь завершения входа.');
+      throw const ApiException('Дождитесь завершения операции с аккаунтом.');
     }
     final key = id ?? _uuid();
     final directory = services;
@@ -588,7 +579,7 @@ class ApiClient extends ChangeNotifier {
 
   Future<void> removeSubscription(String id) async {
     if (_authenticating) {
-      throw const ApiException('Дождитесь завершения входа.');
+      throw const ApiException('Дождитесь завершения операции с аккаунтом.');
     }
     subscriptions = subscriptions.where((s) => s['id'] != id).toList();
     _pending.add({'operation': _uuid(), 'kind': 'delete', 'id': id});
@@ -597,7 +588,7 @@ class ApiClient extends ChangeNotifier {
 
   Future<void> saveReminders(Map<String, dynamic> settings) async {
     if (_authenticating) {
-      throw const ApiException('Дождитесь завершения входа.');
+      throw const ApiException('Дождитесь завершения операции с аккаунтом.');
     }
     profile = {...?profile, 'reminders': settings};
     _pending.add({
@@ -618,25 +609,41 @@ class ApiClient extends ChangeNotifier {
   }
 
   Future<void> logout() async {
-    if (_reloading || _authenticating || _pending.isNotEmpty) {
+    if (_reloadInProgress != null || _authenticating || _pending.isNotEmpty) {
       throw const ApiException(
         'Дождитесь синхронизации изменений перед выходом.',
       );
     }
-    if (_refresh != null) {
-      try {
-        await post('/auth/logout', {'refresh_token': _refresh});
-      } catch (_) {}
+    _authenticating = true;
+    try {
+      if (_refresh != null) {
+        try {
+          await post('/auth/logout', {'refresh_token': _refresh});
+        } catch (_) {}
+      }
+      await _clearSession();
+    } finally {
+      _authenticating = false;
+      notifyListeners();
     }
-    if (_pending.isNotEmpty) {
-      throw const ApiException(
-        'Есть несинхронизированные изменения. Подключитесь к серверу перед выходом.',
-      );
-    }
-    await clearSession();
   }
 
-  Future<void> clearSession() async {
+  Future<void> deleteAccount() async {
+    if (_authenticating) {
+      throw const ApiException('Дождитесь завершения операции с аккаунтом.');
+    }
+    _authenticating = true;
+    try {
+      await _reloadInProgress;
+      await delete('/me');
+      await _clearSession();
+    } finally {
+      _authenticating = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> _clearSession() async {
     final previousKey = _cacheKey;
     needsSignIn = false;
     offline = false;
@@ -658,6 +665,5 @@ class ApiClient extends ChangeNotifier {
     try {
       await ReminderService.instance.plugin.cancelAll();
     } catch (_) {}
-    notifyListeners();
   }
 }

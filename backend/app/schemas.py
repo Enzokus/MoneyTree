@@ -15,14 +15,8 @@ class PasswordLoginInput(BaseModel):
     password: str = Field(min_length=1, max_length=256)
 
 
-class RegistrationStart(BaseModel):
-    identifier: str = Field(min_length=1, max_length=255)
-
-
-class RegistrationComplete(BaseModel):
-    challenge_id: UUID
-    code: str
-    password: str
+class RegistrationInput(PasswordLoginInput):
+    password: str = Field(min_length=12, max_length=256)
 
 
 class SubscriptionInput(BaseModel):

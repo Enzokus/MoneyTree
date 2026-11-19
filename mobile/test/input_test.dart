@@ -4,29 +4,37 @@ import 'package:intl/date_symbol_data_local.dart';
 import 'package:subscription_tree/api.dart';
 import 'package:subscription_tree/main.dart';
 import 'package:subscription_tree/input_validation.dart';
+import 'package:timezone/data/latest_all.dart' as tzdata;
 
 class RegistrationTestApi extends ApiClient {
-  String? identifier;
-  List<String>? confirmation;
+  List<String>? credentials;
 
   @override
-  Future<String> requestRegistrationCode(String identifier) async {
-    this.identifier = identifier;
-    return 'challenge-id';
+  Future<void> register(String identifier, String password) async {
+    credentials = [identifier, password];
+  }
+}
+
+class AccountMenuTestApi extends ApiClient {
+  int deletions = 0;
+  int logouts = 0;
+
+  @override
+  Future<void> deleteAccount() async {
+    deletions++;
   }
 
   @override
-  Future<void> completeRegistration(
-    String challengeId,
-    String code,
-    String password,
-  ) async {
-    confirmation = [challengeId, code, password];
+  Future<void> logout() async {
+    logouts++;
   }
 }
 
 void main() {
-  setUpAll(() => initializeDateFormatting('ru'));
+  setUpAll(() async {
+    tzdata.initializeTimeZones();
+    await initializeDateFormatting('ru');
+  });
 
   testWidgets('Login displays the Russian prefix and offers email', (
     tester,
@@ -62,7 +70,7 @@ void main() {
 
   for (final byPhone in [true, false]) {
     testWidgets(
-      'Registration confirms ${byPhone ? 'phone' : 'email'} by code',
+      'Registration accepts ${byPhone ? 'phone' : 'email'} and a password',
       (tester) async {
         final api = RegistrationTestApi();
         addTearDown(api.dispose);
@@ -84,24 +92,52 @@ void main() {
           find.widgetWithText(TextFormField, 'Пароль'),
           'Good test password',
         );
-        await tester.tap(find.text('Получить код'));
+        await tester.tap(find.text('Зарегистрироваться'));
         await tester.pumpAndSettle();
-        expect(api.identifier, byPhone ? '+79121234567' : 'user@example.org');
-        expect(contact, findsNothing);
-        await tester.enterText(
-          find.byKey(const ValueKey('registration-code')),
-          '012345',
-        );
-        await tester.tap(find.text('Подтвердить и войти'));
-        await tester.pumpAndSettle();
-        expect(api.confirmation, [
-          'challenge-id',
-          '012345',
+        expect(api.credentials, [
+          byPhone ? '+79121234567' : 'user@example.org',
           'Good test password',
         ]);
+        expect(find.byKey(const ValueKey('registration-code')), findsNothing);
       },
     );
   }
+
+  testWidgets('Account menu displays red actions and confirms deletion', (
+    tester,
+  ) async {
+    final api = AccountMenuTestApi();
+    addTearDown(api.dispose);
+    await tester.pumpWidget(MaterialApp(home: HomePage(api: api)));
+    final menu = find.byTooltip('Меню');
+    final logout = find.text('Выйти из аккаунта');
+    final deleteAccount = find.text('Удалить аккаунт');
+    await tester.tap(menu);
+    await tester.pumpAndSettle();
+    expect(tester.widget<Text>(logout).style?.color, Colors.redAccent);
+    expect(tester.widget<Text>(deleteAccount).style?.color, Colors.redAccent);
+    await tester.tap(logout);
+    await tester.pumpAndSettle();
+    expect(api.logouts, 1);
+    expect(api.deletions, 0);
+
+    await tester.tap(menu);
+    await tester.pumpAndSettle();
+    await tester.tap(deleteAccount);
+    await tester.pumpAndSettle();
+    expect(find.text('Удалить аккаунт?'), findsOneWidget);
+    await tester.tap(find.text('Отмена'));
+    await tester.pumpAndSettle();
+    expect(api.deletions, 0);
+
+    await tester.tap(menu);
+    await tester.pumpAndSettle();
+    await tester.tap(deleteAccount);
+    await tester.pumpAndSettle();
+    await tester.tap(deleteAccount);
+    await tester.pumpAndSettle();
+    expect(api.deletions, 1);
+  });
 
   testWidgets('Russian text is accepted and letters cannot enter price', (
     tester,

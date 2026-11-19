@@ -1,9 +1,7 @@
 import os
-import re
 import tempfile
 from datetime import date
 from decimal import Decimal
-from time import time
 
 os.environ['DATABASE_URL'] = 'sqlite:///' + tempfile.mktemp(suffix='.db')
 os.environ['JWT_SECRET'] = 'test-secret-only-for-unit-tests-0123456789'
@@ -16,7 +14,7 @@ from app.billing import advance, monthly_equivalent, upcoming
 from app.db import SessionLocal
 from app.main import app, token_pair
 from app.config import settings
-from app.models import CatalogPlan, User
+from app.models import CatalogPlan, PasswordLogin, RefreshSession, Subscription, SubscriptionDetails, User
 from app.passwords import DEV_EMAIL, DEV_PASSWORD, DEV_PHONE
 
 client = TestClient(app)
@@ -49,59 +47,66 @@ def test_password_login_accepts_phone_and_email_for_the_same_account(monkeypatch
     assert client.post('/auth/login', json={'identifier': DEV_EMAIL, 'password': DEV_PASSWORD}).status_code == 401
 
 
-@pytest.mark.parametrize(('identifier', 'canonical', 'transport'), [
-    (' NEW@MONEYTREE.TEST ', 'new@moneytree.test', 'email'),
-    ('8 (912) 123-45-67', '+79121234567', 'sms'),
+@pytest.mark.parametrize(('identifier', 'canonical'), [
+    (' NEW@MONEYTREE.TEST ', 'new@moneytree.test'),
+    ('8 (912) 123-45-67', '+79121234567'),
 ])
-def test_registration_verifies_contact_and_code_only_once(monkeypatch, identifier, canonical, transport):
-    delivered = []
-    monkeypatch.setattr(settings, 'smtp_host', 'smtp.example.test')
-    monkeypatch.setattr(settings, 'smtp_from', 'noreply@example.test')
-    monkeypatch.setattr(settings, 'sms_ru_api_id', 'test-key')
-    monkeypatch.setattr(f'app.delivery.send_{transport}', lambda recipient, message: delivered.append((recipient, message)))
-    response = client.post('/auth/register/start', json={'identifier': identifier})
-    assert response.status_code == 200
-    assert set(response.json()) == {'challenge_id'}
-    assert len(delivered) == 1 and delivered[0][0] == canonical
-    code = re.search(r'\b[0-9]{6}\b', delivered[0][1])[0]
-    assert client.post('/auth/register/start', json={'identifier': canonical}).status_code == 429
-
+def test_registration_creates_account_without_a_code(identifier, canonical):
     password = 'Unique test password!'
-    credentials = {'identifier': canonical, 'password': password}
-    assert client.post('/auth/login', json=credentials).status_code == 401
-    body = {'challenge_id': response.json()['challenge_id'], 'code': code, 'password': password}
-    wrong_code = '000000' if code != '000000' else '000001'
-    assert client.post('/auth/register/complete', json={**body, 'code': wrong_code}).status_code == 400
-    registered = client.post('/auth/register/complete', json=body)
+    registered = client.post('/auth/register', json={'identifier': identifier, 'password': password})
     assert registered.status_code == 201
     profile = client.get('/me', headers=headers(registered.json())).json()
-    login_result = client.post('/auth/login', json=credentials)
-    assert login_result.status_code == 200
-    assert client.get('/me', headers=headers(login_result.json())).json()['id'] == profile['id']
-    assert client.post('/auth/register/complete', json=body).status_code == 400
-    assert client.post('/auth/register/start', json={'identifier': canonical}).status_code == 409
+    credentials = {'identifier': canonical, 'password': password}
+    signed_in = client.post('/auth/login', json=credentials)
+    assert signed_in.status_code == 200
+    assert client.get('/me', headers=headers(signed_in.json())).json()['id'] == profile['id']
+    assert client.post('/auth/register', json=credentials).status_code == 409
+    with SessionLocal() as db:
+        assert db.get(PasswordLogin, profile['id']).password_hash != password
 
 
-def test_registration_expiry_resend_and_attempt_limit(monkeypatch):
-    now = int(time())
-    delivered = []
-    monkeypatch.setattr('app.registration.time', lambda: now)
-    monkeypatch.setattr('app.registration.ensure_delivery_configured', lambda _: None)
-    monkeypatch.setattr('app.registration.send_registration_code', lambda _, code: delivered.append(code))
-    contact = {'identifier': 'expiry@moneytree.test'}
-    first = client.post('/auth/register/start', json=contact).json()['challenge_id']
-    body = {'challenge_id': first, 'code': delivered[0], 'password': 'Password of 12+ characters'}
-    wrong_code = '000000' if delivered[0] != '000000' else '000001'
-    for _ in range(5):
-        assert client.post('/auth/register/complete', json={**body, 'code': wrong_code}).status_code == 400
-    assert client.post('/auth/register/complete', json=body).json()['detail'] == 'Code expired or used'
-    now += 60
-    second = client.post('/auth/register/start', json=contact).json()['challenge_id']
-    assert first != second
-    assert client.post('/auth/register/complete', json=body).status_code == 400
-    body.update(challenge_id=second, code=delivered[1])
-    now += 600
-    assert client.post('/auth/register/complete', json=body).status_code == 400
+def test_registration_rejects_invalid_contact_and_short_password():
+    assert client.post('/auth/register', json={'identifier': 'abc@', 'password': 'Valid password'}).status_code == 422
+    assert client.post('/auth/register', json={'identifier': '123', 'password': 'Valid password'}).status_code == 422
+    assert client.post('/auth/register', json={'identifier': 'valid@moneytree.test', 'password': 'short'}).status_code == 422
+
+
+def test_logout_preserves_data_and_account_deletion_removes_it():
+    credentials = {'identifier': 'delete@moneytree.test', 'password': 'Unique test password!'}
+    tokens = client.post('/auth/register', json=credentials).json()
+    first_session = headers(tokens)
+    owner_id = client.get('/me', headers=first_session).json()['id']
+    payload = {
+        'name': 'Account deletion test', 'amount': '100', 'period': 'monthly',
+        'next_charge_date': '2099-12-01', 'bank_name': 'Test Bank',
+    }
+    created = client.post('/subscriptions', json=payload, headers=first_session)
+    assert created.status_code == 201
+    subscription_id = created.json()['id']
+    assert client.post('/auth/logout', json={'refresh_token': tokens['refresh_token']},
+                       headers=first_session).status_code == 200
+
+    second_tokens = client.post('/auth/login', json=credentials).json()
+    other_tokens = client.post('/auth/login', json=credentials).json()
+    second_session = headers(second_tokens)
+    assert client.get('/subscriptions', headers=second_session).json()[0]['id'] == subscription_id
+    assert client.delete('/me').status_code == 401
+    assert client.delete('/me', headers=second_session).status_code == 200
+
+    with SessionLocal() as db:
+        assert db.get(User, owner_id) is None
+        assert db.get(PasswordLogin, owner_id) is None
+        assert db.get(Subscription, subscription_id) is None
+        assert db.get(SubscriptionDetails, subscription_id) is None
+        assert db.scalar(select(RefreshSession).where(RefreshSession.user_id == owner_id)) is None
+    assert client.get('/me', headers=headers(other_tokens)).status_code == 401
+    assert client.post('/auth/refresh', json={'refresh_token': other_tokens['refresh_token']}).status_code == 401
+    assert client.post('/auth/login', json=credentials).status_code == 401
+
+    registered_again = client.post('/auth/register', json=credentials)
+    assert registered_again.status_code == 201
+    assert client.get('/subscriptions', headers=headers(registered_again.json())).json() == []
+    assert client.get('/me', headers=headers(login())).status_code == 200
 
 
 def test_device_timezone_and_russian_subscription():

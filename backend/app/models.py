@@ -43,15 +43,6 @@ class PasswordLogin(Base):
     password_hash: Mapped[str] = mapped_column(String(128), nullable=False)
 
 
-class RegistrationCode(Base):
-    __tablename__ = 'registration_codes'
-    identifier: Mapped[str] = mapped_column(String(255), primary_key=True)
-    challenge_id: Mapped[str] = mapped_column(String(36), unique=True, nullable=False)
-    code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    sent_at: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
-    attempts: Mapped[int] = mapped_column(Integer, nullable=False)
-
-
 class RegistrationLimit(Base):
     __tablename__ = 'registration_limits'
     key: Mapped[str] = mapped_column(String(100), primary_key=True)
