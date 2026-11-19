@@ -9,6 +9,21 @@ Period = Literal['weekly', 'monthly', 'quarterly', 'yearly']
 Status = Literal['active', 'paused', 'cancelled']
 
 
+class PasswordLoginInput(BaseModel):
+    identifier: str = Field(min_length=1, max_length=255)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class RegistrationStart(BaseModel):
+    identifier: str = Field(min_length=1, max_length=255)
+
+
+class RegistrationComplete(BaseModel):
+    challenge_id: UUID
+    code: str
+    password: str
+
+
 class SubscriptionInput(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     plan_name: str | None = Field(default=None, max_length=120)

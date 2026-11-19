@@ -9,6 +9,13 @@ class Settings(BaseSettings):
     yandex_client_secret: str = ''
     yandex_redirect_uri: str = ''
     allow_dev_auth: bool = False
+    smtp_host: str = ''
+    smtp_port: int = 465
+    smtp_starttls: bool = False
+    smtp_username: str = ''
+    smtp_password: str = ''
+    smtp_from: str = ''
+    sms_ru_api_id: str = ''
     ollama_url: str = ''
     ollama_model: str = ''
 

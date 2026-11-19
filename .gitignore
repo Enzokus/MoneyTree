@@ -30,6 +30,7 @@ __pycache__/
 key.properties
 
 # Presentation intermediates and manual test outputs
+/presentation/
 /.deck-build/
 *.log
 /input-check.png

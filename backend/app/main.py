@@ -16,12 +16,17 @@ from sqlalchemy.orm import Session
 from .billing import monthly_equivalent, upcoming
 from .config import settings
 from .db import Base, engine, get_db
-from .models import CatalogPlan, RefreshSession, Subscription, User
-from .schemas import AskInput, ReminderSettings, SubscriptionCreate, SubscriptionInput, SubscriptionOut
+from .models import CatalogPlan, PasswordLogin, RefreshSession, Subscription, User
+from .passwords import DEV_USER_ID, normalize_ru_phone, seed_dev_account, verify_password
+from .registration import complete_registration, start_registration
+from .schemas import (AskInput, PasswordLoginInput, RegistrationComplete, RegistrationStart,
+                      ReminderSettings, SubscriptionCreate, SubscriptionInput, SubscriptionOut)
 
-Base.metadata.create_all(engine)
 if len(settings.jwt_secret) < 32 or settings.jwt_secret.startswith('replace_with_'):
     raise RuntimeError('JWT_SECRET must contain at least 32 characters')
+Base.metadata.create_all(engine)
+if settings.allow_dev_auth:
+    seed_dev_account()
 app = FastAPI(title='Subscription Tree API', version='0.1.0')
 Db = Annotated[Session, Depends(get_db)]
 
@@ -96,16 +101,37 @@ async def yandex_exchange(body: ExchangeInput, db: Db):
     return token_pair(db, user)
 
 
-@app.post('/auth/dev')
-def dev_auth(request: Request, db: Db):
-    if not settings.allow_dev_auth or request.client.host not in ('127.0.0.1', '::1', 'testclient'):
-        raise HTTPException(404)
-    user = db.scalar(select(User).where(User.yandex_id == 'dev-local'))
-    if not user:
-        user = User(yandex_id='dev-local', display_name='Тестовый пользователь')
-        db.add(user)
-        db.flush()
+@app.post('/auth/login')
+def password_login(body: PasswordLoginInput, request: Request, db: Db):
+    identifier = body.identifier.strip().lower()
+    if '@' in identifier:
+        lookup = PasswordLogin.email == identifier
+    else:
+        phone = normalize_ru_phone(identifier)
+        lookup = PasswordLogin.phone == phone if phone else False
+    statement = select(PasswordLogin, User).join(User).where(lookup)
+    record, user = db.execute(statement).one_or_none() or (None, None)
+    password_matches = verify_password(body.password, record.password_hash if record else None)
+    if not user or not password_matches:
+        raise HTTPException(401, 'Invalid credentials')
+    if user.yandex_id == DEV_USER_ID and (
+        not settings.allow_dev_auth
+        or not request.client
+        or request.client.host not in ('127.0.0.1', '::1', 'testclient')
+    ):
+        raise HTTPException(401, 'Invalid credentials')
     return token_pair(db, user)
+
+
+@app.post('/auth/register/start')
+def registration_start(body: RegistrationStart, request: Request, db: Db):
+    source = request.client.host if request.client else 'unknown'
+    return {'challenge_id': start_registration(db, body.identifier, source)}
+
+
+@app.post('/auth/register/complete', status_code=201)
+def registration_complete(body: RegistrationComplete, db: Db):
+    return token_pair(db, complete_registration(db, body))
 
 
 @app.post('/auth/refresh')

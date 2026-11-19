@@ -21,11 +21,11 @@ const yandexRedirectUri = String.fromEnvironment(
   'YANDEX_REDIRECT_URI',
   defaultValue: 'subscriptiontree://oauth',
 );
-const devAuth = bool.fromEnvironment('DEV_AUTH');
 
 class ApiException implements Exception {
-  const ApiException(this.message);
+  const ApiException(this.message, {this.statusCode});
   final String message;
+  final int? statusCode;
   @override
   String toString() => message;
 }
@@ -41,7 +41,6 @@ class ApiClient extends ChangeNotifier {
     if (!_disposed) super.notifyListeners();
   }
 
-  bool localOnly = false;
   bool _reloading = false;
   bool _authenticating = false;
   Future<void>? _refreshing;
@@ -67,21 +66,25 @@ class ApiClient extends ChangeNotifier {
 
   int _revision = 0;
   List<Map<String, dynamic>> _pending = [];
-  String get _cacheKey {
-    if (localOnly) return 'offline_guest_v1';
+  String? _accountId(String? token) {
     try {
       final payload = jsonDecode(
         utf8.decode(
-          base64Url.decode(base64Url.normalize(_access!.split('.')[1])),
+          base64Url.decode(base64Url.normalize(token!.split('.')[1])),
         ),
       );
-      return 'offline_account_v1_${payload['sub']}';
+      return payload['sub'] as String?;
     } catch (_) {
-      return 'offline_account_v1';
+      return null;
     }
   }
 
-  bool get canOpen => signedIn || localOnly;
+  String get _cacheKey {
+    final id = _accountId(_access);
+    return id == null ? 'offline_account_v1' : 'offline_account_v1_$id';
+  }
+
+  bool get canOpen => signedIn;
   int get pendingCount => _pending.length;
 
   String _uuid() {
@@ -116,9 +119,7 @@ class ApiClient extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString(_cacheKey);
     if (raw == null) {
-      final legacy = localOnly || !migrateLegacy
-          ? null
-          : prefs.getString('subscriptions');
+      final legacy = migrateLegacy ? prefs.getString('subscriptions') : null;
       subscriptions = legacy == null ? [] : _rows(jsonDecode(legacy));
       catalog = [];
       recommendations = [];
@@ -134,16 +135,6 @@ class ApiClient extends ChangeNotifier {
         ? null
         : Map<String, dynamic>.from(data['profile']);
     _pending = _rows(data['pending'] ?? []);
-  }
-
-  Future<void> enterLocalMode() async {
-    localOnly = true;
-    offline = true;
-    await _restore();
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('local_mode', true);
-    await _syncReminders();
-    notifyListeners();
   }
 
   Future<void> _syncReminders() async {
@@ -168,32 +159,74 @@ class ApiClient extends ChangeNotifier {
   Map<String, dynamic>? profile;
   bool loading = true;
   bool offline = false;
+  bool needsSignIn = false;
 
   bool get signedIn => _refresh != null;
 
   Future<void> init() async {
     _access = await _storage.read(key: 'access');
     _refresh = await _storage.read(key: 'refresh');
-    final prefs = await SharedPreferences.getInstance();
-    localOnly = !signedIn && (prefs.getBool('local_mode') ?? false);
-    await _restore(migrateLegacy: signedIn);
-    offline = true;
+    if (signedIn) await _restore(migrateLegacy: true);
+    offline = signedIn;
     loading = false;
     await _syncReminders();
     notifyListeners();
     _retryTimer = Timer.periodic(const Duration(seconds: 30), (_) {
-      if (signedIn && !localOnly) unawaited(reload());
+      if (signedIn) unawaited(reload());
     });
     if (signedIn) unawaited(reload());
   }
 
-  Future<void> loginYandex() async {
+  Future<void> loginWithPassword(String identifier, String password) => _signIn(
+    () => _rawPost('/auth/login', {
+      'identifier': identifier,
+      'password': password,
+    }),
+  );
+
+  Future<String> requestRegistrationCode(String identifier) async {
+    final response = await _rawPost('/auth/register/start', {
+      'identifier': identifier,
+    }, timeout: const Duration(seconds: 30));
+    return response['challenge_id'] as String;
+  }
+
+  Future<void> completeRegistration(
+    String challengeId,
+    String code,
+    String password,
+  ) => _signIn(
+    () => _rawPost('/auth/register/complete', {
+      'challenge_id': challengeId,
+      'code': code,
+      'password': password,
+    }),
+  );
+
+  Future<void> loginYandex() => _signIn(_authenticateYandex);
+
+  Future<void> _signIn(
+    Future<Map<String, dynamic>> Function() authenticate,
+  ) async {
     if (_reloading || _authenticating) {
       throw const ApiException('Дождитесь завершения синхронизации или входа.');
     }
     _authenticating = true;
     try {
-      await _authenticateYandex();
+      final tokens = await authenticate();
+      final accountId = _accountId(tokens['access_token'] as String);
+      if (accountId == null) {
+        throw const ApiException('Сервер вернул некорректную сессию');
+      }
+      final wasSignedIn = signedIn;
+      if (wasSignedIn && _accountId(_access) != accountId) {
+        throw const ApiException(
+          'Войдите в текущий аккаунт для продолжения синхронизации',
+        );
+      }
+      await _setTokens(tokens);
+      if (!wasSignedIn) await _restore();
+      needsSignIn = false;
     } finally {
       _authenticating = false;
       notifyListeners();
@@ -201,7 +234,7 @@ class ApiClient extends ChangeNotifier {
     await reload();
   }
 
-  Future<void> _authenticateYandex() async {
+  Future<Map<String, dynamic>> _authenticateYandex() async {
     if (yandexClientId.isEmpty) {
       throw const ApiException('Не задан YANDEX_CLIENT_ID');
     }
@@ -233,38 +266,11 @@ class ApiClient extends ChangeNotifier {
         callback.queryParameters['code'] == null) {
       throw const ApiException('Вход не завершён');
     }
-    final tokens = await _rawPost('/auth/yandex/exchange', {
+    return _rawPost('/auth/yandex/exchange', {
       'code': callback.queryParameters['code'],
       'code_verifier': verifier,
       'redirect_uri': yandexRedirectUri,
     });
-    localOnly = false;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('local_mode', false);
-    await _setTokens(tokens);
-    await _restore();
-  }
-
-  Future<void> loginDev() async {
-    if (!devAuth || !kDebugMode) {
-      throw const ApiException('Тестовый вход выключен');
-    }
-    if (_reloading || _authenticating) {
-      throw const ApiException('Дождитесь завершения синхронизации или входа.');
-    }
-    _authenticating = true;
-    try {
-      final tokens = await _rawPost('/auth/dev', {});
-      localOnly = false;
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool('local_mode', false);
-      await _setTokens(tokens);
-      await _restore();
-    } finally {
-      _authenticating = false;
-      notifyListeners();
-    }
-    await reload();
   }
 
   Future<void> _setTokens(Map<String, dynamic> tokens) async {
@@ -281,7 +287,7 @@ class ApiClient extends ChangeNotifier {
     Object? body,
     bool retry = true,
   ]) async {
-    if (localOnly) {
+    if (!signedIn) {
       throw const ApiException(
         'Эта функция требует входа и подключения к серверу.',
       );
@@ -323,7 +329,8 @@ class ApiClient extends ChangeNotifier {
         return await _request(method, path, body, false);
       } on ApiException catch (error) {
         // A network outage must not erase the session or offline edits.
-        if (error.message == 'Ошибка входа: 401') {
+        if (error.statusCode == 401) {
+          needsSignIn = true;
           throw const ApiException(
             'Сессия истекла. Войдите снова. Локальные данные сохранены.',
           );
@@ -339,7 +346,11 @@ class ApiClient extends ChangeNotifier {
     return response;
   }
 
-  Future<Map<String, dynamic>> _rawPost(String path, Object body) async {
+  Future<Map<String, dynamic>> _rawPost(
+    String path,
+    Object body, {
+    Duration timeout = const Duration(seconds: 10),
+  }) async {
     try {
       final response = await _client
           .post(
@@ -347,9 +358,26 @@ class ApiClient extends ChangeNotifier {
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode(body),
           )
-          .timeout(const Duration(seconds: 10));
+          .timeout(timeout);
       if (response.statusCode >= 400) {
-        throw ApiException('Ошибка входа: ${response.statusCode}');
+        if (path.startsWith('/auth/register/')) {
+          final message = switch (response.statusCode) {
+            400 => 'Код неверный или больше не действует',
+            409 => 'Этот телефон или почта уже зарегистрированы',
+            422 => 'Проверьте данные для регистрации',
+            429 => 'Слишком много запросов. Попробуйте позже',
+            502 => 'Не удалось отправить код. Попробуйте ещё раз',
+            503 => 'Отправка кодов этим способом пока недоступна',
+            _ => 'Ошибка регистрации: ${response.statusCode}',
+          };
+          throw ApiException(message, statusCode: response.statusCode);
+        }
+        throw ApiException(
+          response.statusCode == 401 && path == '/auth/login'
+              ? 'Неверный телефон, почта или пароль'
+              : 'Ошибка входа: ${response.statusCode}',
+          statusCode: response.statusCode,
+        );
       }
       return Map<String, dynamic>.from(
         jsonDecode(utf8.decode(response.bodyBytes)),
@@ -370,7 +398,7 @@ class ApiClient extends ChangeNotifier {
   Future<void> delete(String path) async => _request('DELETE', path);
 
   Future<void> reload() async {
-    if (localOnly || !signedIn || _reloading || _authenticating) return;
+    if (!signedIn || needsSignIn || _reloading || _authenticating) return;
     _reloading = true;
     try {
       for (final op in List<Map<String, dynamic>>.from(_pending)) {
@@ -438,15 +466,13 @@ class ApiClient extends ChangeNotifier {
           value['anchor_day'] ?? DateTime.parse(value['next_charge_date']).day,
     };
     subscriptions = [...subscriptions.where((s) => s['id'] != key), row];
-    if (!localOnly) {
-      _pending.add({
-        'operation': _uuid(),
-        'kind': 'save',
-        'id': key,
-        'create': id == null,
-        'value': value,
-      });
-    }
+    _pending.add({
+      'operation': _uuid(),
+      'kind': 'save',
+      'id': key,
+      'create': id == null,
+      'value': value,
+    });
     await _localChanged();
     try {
       await ReminderService.instance.requestPermission();
@@ -459,9 +485,7 @@ class ApiClient extends ChangeNotifier {
       throw const ApiException('Дождитесь завершения входа.');
     }
     subscriptions = subscriptions.where((s) => s['id'] != id).toList();
-    if (!localOnly) {
-      _pending.add({'operation': _uuid(), 'kind': 'delete', 'id': id});
-    }
+    _pending.add({'operation': _uuid(), 'kind': 'delete', 'id': id});
     await _localChanged();
   }
 
@@ -470,13 +494,11 @@ class ApiClient extends ChangeNotifier {
       throw const ApiException('Дождитесь завершения входа.');
     }
     profile = {...?profile, 'reminders': settings};
-    if (!localOnly) {
-      _pending.add({
-        'operation': _uuid(),
-        'kind': 'reminders',
-        'value': settings,
-      });
-    }
+    _pending.add({
+      'operation': _uuid(),
+      'kind': 'reminders',
+      'value': settings,
+    });
     await _localChanged();
   }
 
@@ -486,7 +508,7 @@ class ApiClient extends ChangeNotifier {
     await _persist();
     await _syncReminders();
     notifyListeners();
-    if (!localOnly) unawaited(reload());
+    unawaited(reload());
   }
 
   Future<void> logout() async {
@@ -509,9 +531,9 @@ class ApiClient extends ChangeNotifier {
   }
 
   Future<void> clearSession() async {
-    final wasLocal = localOnly;
     final previousKey = _cacheKey;
-    localOnly = false;
+    needsSignIn = false;
+    offline = false;
     _access = null;
     _refresh = null;
     profile = null;
@@ -522,11 +544,8 @@ class ApiClient extends ChangeNotifier {
     await _storage.delete(key: 'access');
     await _storage.delete(key: 'refresh');
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('local_mode', false);
-    if (!wasLocal) {
-      await prefs.remove('subscriptions');
-      await prefs.remove(previousKey);
-    }
+    await prefs.remove('subscriptions');
+    await prefs.remove(previousKey);
     try {
       await ReminderService.instance.plugin.cancelAll();
     } catch (_) {}

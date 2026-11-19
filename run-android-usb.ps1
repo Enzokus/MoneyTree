@@ -25,7 +25,7 @@ if ($DeviceId) {
 function Test-TaskBackend {
     try {
         $taskSchema = Invoke-RestMethod 'http://127.0.0.1:8000/openapi.json' -TimeoutSec 2
-        return $taskSchema.info.title -eq 'Subscription Tree API'
+        return $taskSchema.info.title -eq 'Subscription Tree API' -and $null -ne $taskSchema.paths.'/auth/login'
     } catch { return $false }
 }
 if (!(Test-TaskBackend)) {
@@ -49,4 +49,4 @@ if ($LASTEXITCODE -ne 0) { throw 'Не удалось настроить под�
 if ($LASTEXITCODE -ne 0) { throw 'Не удалось установить APK. Проверьте подтверждение установки на телефоне.' }
 & $taskAdb -s $taskDevice shell am start -n com.example.subscription_tree/.MainActivity
 if ($LASTEXITCODE -ne 0) { throw 'Не удалось открыть приложение.' }
-Write-Host 'Готово. На телефоне нажмите «Войти без Яндекса». Для онлайн-работы оставьте USB подключённым и сервер запущенным.'
+Write-Host 'Готово. На телефоне войдите с тестовым телефоном или почтой и паролем из README. Для синхронизации оставьте USB подключённым и сервер запущенным.'

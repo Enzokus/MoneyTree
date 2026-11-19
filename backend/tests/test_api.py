@@ -1,12 +1,15 @@
 import os
+import re
 import tempfile
 from datetime import date
 from decimal import Decimal
+from time import time
 
 os.environ['DATABASE_URL'] = 'sqlite:///' + tempfile.mktemp(suffix='.db')
 os.environ['JWT_SECRET'] = 'test-secret-only-for-unit-tests-0123456789'
 os.environ['ALLOW_DEV_AUTH'] = 'true'
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from app.billing import advance, monthly_equivalent, upcoming
@@ -14,18 +17,91 @@ from app.db import SessionLocal
 from app.main import app, token_pair
 from app.config import settings
 from app.models import CatalogPlan, User
+from app.passwords import DEV_EMAIL, DEV_PASSWORD, DEV_PHONE
 
 client = TestClient(app)
 
 
 def login():
-    response = client.post('/auth/dev')
+    response = client.post('/auth/login', json={'identifier': DEV_EMAIL, 'password': DEV_PASSWORD})
     assert response.status_code == 200
     return response.json()
 
 
 def headers(tokens):
     return {'Authorization': 'Bearer ' + tokens['access_token']}
+
+
+def test_password_login_accepts_phone_and_email_for_the_same_account(monkeypatch):
+    expected_user = client.get('/me', headers=headers(login())).json()['id']
+    for identifier in (' DEV@MONEYTREE.TEST ', DEV_PHONE, '8 (987) 000-00-01', '9870000001'):
+        response = client.post('/auth/login', json={'identifier': identifier, 'password': DEV_PASSWORD})
+        assert response.status_code == 200
+        assert client.get('/me', headers=headers(response.json())).json()['id'] == expected_user
+
+    bad_password = client.post('/auth/login', json={'identifier': DEV_PHONE, 'password': 'bad password'})
+    unknown_user = client.post('/auth/login', json={'identifier': 'unknown@moneytree.test', 'password': DEV_PASSWORD})
+    assert bad_password.status_code == unknown_user.status_code == 401
+    assert bad_password.json() == unknown_user.json()
+    assert client.post('/auth/dev').status_code == 404
+
+    monkeypatch.setattr(settings, 'allow_dev_auth', False)
+    assert client.post('/auth/login', json={'identifier': DEV_EMAIL, 'password': DEV_PASSWORD}).status_code == 401
+
+
+@pytest.mark.parametrize(('identifier', 'canonical', 'transport'), [
+    (' NEW@MONEYTREE.TEST ', 'new@moneytree.test', 'email'),
+    ('8 (912) 123-45-67', '+79121234567', 'sms'),
+])
+def test_registration_verifies_contact_and_code_only_once(monkeypatch, identifier, canonical, transport):
+    delivered = []
+    monkeypatch.setattr(settings, 'smtp_host', 'smtp.example.test')
+    monkeypatch.setattr(settings, 'smtp_from', 'noreply@example.test')
+    monkeypatch.setattr(settings, 'sms_ru_api_id', 'test-key')
+    monkeypatch.setattr(f'app.delivery.send_{transport}', lambda recipient, message: delivered.append((recipient, message)))
+    response = client.post('/auth/register/start', json={'identifier': identifier})
+    assert response.status_code == 200
+    assert set(response.json()) == {'challenge_id'}
+    assert len(delivered) == 1 and delivered[0][0] == canonical
+    code = re.search(r'\b[0-9]{6}\b', delivered[0][1])[0]
+    assert client.post('/auth/register/start', json={'identifier': canonical}).status_code == 429
+
+    password = 'Unique test password!'
+    credentials = {'identifier': canonical, 'password': password}
+    assert client.post('/auth/login', json=credentials).status_code == 401
+    body = {'challenge_id': response.json()['challenge_id'], 'code': code, 'password': password}
+    wrong_code = '000000' if code != '000000' else '000001'
+    assert client.post('/auth/register/complete', json={**body, 'code': wrong_code}).status_code == 400
+    registered = client.post('/auth/register/complete', json=body)
+    assert registered.status_code == 201
+    profile = client.get('/me', headers=headers(registered.json())).json()
+    login_result = client.post('/auth/login', json=credentials)
+    assert login_result.status_code == 200
+    assert client.get('/me', headers=headers(login_result.json())).json()['id'] == profile['id']
+    assert client.post('/auth/register/complete', json=body).status_code == 400
+    assert client.post('/auth/register/start', json={'identifier': canonical}).status_code == 409
+
+
+def test_registration_expiry_resend_and_attempt_limit(monkeypatch):
+    now = int(time())
+    delivered = []
+    monkeypatch.setattr('app.registration.time', lambda: now)
+    monkeypatch.setattr('app.registration.ensure_delivery_configured', lambda _: None)
+    monkeypatch.setattr('app.registration.send_registration_code', lambda _, code: delivered.append(code))
+    contact = {'identifier': 'expiry@moneytree.test'}
+    first = client.post('/auth/register/start', json=contact).json()['challenge_id']
+    body = {'challenge_id': first, 'code': delivered[0], 'password': 'Password of 12+ characters'}
+    wrong_code = '000000' if delivered[0] != '000000' else '000001'
+    for _ in range(5):
+        assert client.post('/auth/register/complete', json={**body, 'code': wrong_code}).status_code == 400
+    assert client.post('/auth/register/complete', json=body).json()['detail'] == 'Code expired or used'
+    now += 60
+    second = client.post('/auth/register/start', json=contact).json()['challenge_id']
+    assert first != second
+    assert client.post('/auth/register/complete', json=body).status_code == 400
+    body.update(challenge_id=second, code=delivered[1])
+    now += 600
+    assert client.post('/auth/register/complete', json=body).status_code == 400
 
 
 def test_device_timezone_and_russian_subscription():

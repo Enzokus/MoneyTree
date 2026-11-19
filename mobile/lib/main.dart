@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'input_validation.dart';
 
@@ -123,31 +124,88 @@ void errorSnack(BuildContext context, Object error) {
 }
 
 class LoginPage extends StatefulWidget {
-  const LoginPage({super.key, required this.api});
+  const LoginPage({super.key, required this.api, this.reauthenticate = false});
   final ApiClient api;
+  final bool reauthenticate;
   @override
   State<LoginPage> createState() => _LoginPageState();
 }
 
 class _LoginPageState extends State<LoginPage> {
-  bool busy = false;
-  Future<void> enter(bool dev) async {
-    setState(() => busy = true);
-    try {
-      if (dev) {
-        await widget.api.loginDev();
+  final _formKey = GlobalKey<FormState>();
+  final _phone = TextEditingController();
+  final _email = TextEditingController();
+  final _password = TextEditingController();
+  final _code = TextEditingController();
+  bool _byPhone = true;
+  bool _busy = false;
+  bool _showPassword = false;
+  bool _registering = false;
+  String? _challengeId;
+
+  String get _identifier => _byPhone ? '+7${_phone.text}' : _email.text.trim();
+
+  @override
+  void dispose() {
+    _phone.dispose();
+    _email.dispose();
+    _password.dispose();
+    _code.dispose();
+    super.dispose();
+  }
+
+  Future<void> _enter() async {
+    if (_busy || !_formKey.currentState!.validate()) return;
+    await _run(() async {
+      final challengeId = _challengeId;
+      if (!_registering) {
+        await widget.api.loginWithPassword(_identifier, _password.text);
+        if (mounted && widget.reauthenticate) Navigator.of(context).pop();
+      } else if (challengeId == null) {
+        await _requestCode();
       } else {
-        await widget.api.loginYandex();
+        await widget.api.completeRegistration(
+          challengeId,
+          _code.text,
+          _password.text,
+        );
       }
+    });
+  }
+
+  Future<void> _requestCode() async {
+    final challengeId = await widget.api.requestRegistrationCode(_identifier);
+    if (!mounted) return;
+    _code.clear();
+    setState(() => _challengeId = challengeId);
+  }
+
+  Future<void> _run(Future<void> Function() action) async {
+    if (_busy) return;
+    FocusScope.of(context).unfocus();
+    setState(() => _busy = true);
+    try {
+      await action();
     } catch (e) {
       if (mounted) errorSnack(context, e);
     } finally {
-      if (mounted) setState(() => busy = false);
+      if (mounted) setState(() => _busy = false);
     }
+  }
+
+  void _changeMode() {
+    _password.clear();
+    _code.clear();
+    setState(() {
+      _registering = !_registering;
+      _challengeId = null;
+      _showPassword = false;
+    });
   }
 
   @override
   Widget build(BuildContext context) => Scaffold(
+    appBar: widget.reauthenticate ? AppBar(title: const Text('Вход')) : null,
     body: Container(
       decoration: const BoxDecoration(
         gradient: LinearGradient(
@@ -157,67 +215,189 @@ class _LoginPageState extends State<LoginPage> {
         ),
       ),
       child: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(28),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              const Icon(Icons.spa, size: 100, color: pink),
-              const SizedBox(height: 28),
-              const Text(
-                'Денежное дерево',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  fontSize: 32,
-                  fontWeight: FontWeight.bold,
-                  color: pale,
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 380),
+              child: Form(
+                key: _formKey,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const Icon(Icons.spa, size: 72, color: pink),
+                    const SizedBox(height: 16),
+                    Text(
+                      _registering ? 'Регистрация' : 'Денежное дерево',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        fontSize: 30,
+                        fontWeight: FontWeight.bold,
+                        color: pale,
+                      ),
+                    ),
+                    const SizedBox(height: 28),
+                    if (_challengeId == null) ...[
+                      SegmentedButton<bool>(
+                        segments: const [
+                          ButtonSegment(value: true, label: Text('Телефон')),
+                          ButtonSegment(value: false, label: Text('Почта')),
+                        ],
+                        selected: {_byPhone},
+                        showSelectedIcon: false,
+                        onSelectionChanged: _busy
+                            ? null
+                            : (selection) =>
+                                  setState(() => _byPhone = selection.single),
+                      ),
+                      const SizedBox(height: 16),
+                      if (_byPhone)
+                        TextFormField(
+                          key: const ValueKey('login-phone'),
+                          controller: _phone,
+                          enabled: !_busy,
+                          keyboardType: TextInputType.phone,
+                          textInputAction: TextInputAction.next,
+                          inputFormatters: [RussianPhoneInputFormatter()],
+                          decoration: const InputDecoration(
+                            labelText: 'Номер телефона',
+                            prefixText: '+7 ',
+                          ),
+                          validator: (value) =>
+                              RegExp(r'^[0-9]{10}$').hasMatch(value ?? '')
+                              ? null
+                              : 'Введите 10 цифр номера',
+                        )
+                      else
+                        TextFormField(
+                          key: const ValueKey('login-email'),
+                          controller: _email,
+                          enabled: !_busy,
+                          keyboardType: TextInputType.emailAddress,
+                          autocorrect: false,
+                          textInputAction: TextInputAction.next,
+                          decoration: const InputDecoration(
+                            labelText: 'Электронная почта',
+                          ),
+                          validator: (value) =>
+                              RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
+                                  .hasMatch((value ?? '').trim())
+                              ? null
+                              : 'Введите адрес электронной почты',
+                        ),
+                      const SizedBox(height: 12),
+                      TextFormField(
+                        controller: _password,
+                        enabled: !_busy,
+                        obscureText: !_showPassword,
+                        autocorrect: false,
+                        enableSuggestions: false,
+                        textInputAction: TextInputAction.done,
+                        onFieldSubmitted: (_) => _enter(),
+                        validator: (value) {
+                          final length = (value ?? '').runes.length;
+                          if (length == 0) return 'Введите пароль';
+                          if (_registering && (length < 12 || length > 256)) {
+                            return 'Пароль должен содержать от 12 до 256 символов';
+                          }
+                          return null;
+                        },
+                        decoration: InputDecoration(
+                          labelText: 'Пароль',
+                          helperText: _registering
+                              ? 'Минимум 12 символов'
+                              : null,
+                          suffixIcon: IconButton(
+                            tooltip: _showPassword
+                                ? 'Скрыть пароль'
+                                : 'Показать пароль',
+                            onPressed: () =>
+                                setState(() => _showPassword = !_showPassword),
+                            icon: Icon(
+                              _showPassword
+                                  ? Icons.visibility_off
+                                  : Icons.visibility,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ] else ...[
+                      Text(
+                        _byPhone
+                            ? 'Отправили SMS с кодом на $_identifier'
+                            : 'Отправили письмо с кодом на $_identifier',
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 16),
+                      TextFormField(
+                        key: const ValueKey('registration-code'),
+                        controller: _code,
+                        enabled: !_busy,
+                        keyboardType: TextInputType.number,
+                        textInputAction: TextInputAction.done,
+                        autofillHints: const [AutofillHints.oneTimeCode],
+                        inputFormatters: [
+                          FilteringTextInputFormatter.digitsOnly,
+                          LengthLimitingTextInputFormatter(6),
+                        ],
+                        decoration: const InputDecoration(
+                          labelText: 'Код из 6 цифр',
+                        ),
+                        onFieldSubmitted: (_) => _enter(),
+                        validator: (value) => (value ?? '').length == 6
+                            ? null
+                            : 'Введите 6 цифр кода',
+                      ),
+                    ],
+                    const SizedBox(height: 20),
+                    FilledButton(
+                      onPressed: _busy ? null : _enter,
+                      child: Text(
+                        _busy
+                            ? 'Подождите…'
+                            : !_registering
+                            ? 'Войти'
+                            : _challengeId == null
+                            ? 'Получить код'
+                            : 'Подтвердить и войти',
+                      ),
+                    ),
+                    if (_challengeId != null) ...[
+                      TextButton(
+                        onPressed: _busy ? null : () => _run(_requestCode),
+                        child: const Text('Отправить код ещё раз'),
+                      ),
+                      TextButton(
+                        onPressed: _busy
+                            ? null
+                            : () => setState(() => _challengeId = null),
+                        child: const Text('Изменить данные'),
+                      ),
+                    ],
+                    if (!_registering) ...[
+                      const OutlinedButton(
+                        onPressed: null,
+                        child: Text('Войти через Яндекс ID'),
+                      ),
+                      const Text(
+                        'Яндекс ID пока недоступен',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: Colors.white54),
+                      ),
+                    ],
+                    if (!widget.reauthenticate && _challengeId == null)
+                      TextButton(
+                        onPressed: _busy ? null : _changeMode,
+                        child: Text(
+                          _registering
+                              ? 'У меня уже есть аккаунт'
+                              : 'Создать аккаунт',
+                        ),
+                      ),
+                  ],
                 ),
               ),
-              const SizedBox(height: 12),
-              const Text(
-                'Ваши подписки, ближайшие платежи и идеи для экономии в одном месте.',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 16, color: Color(0xFFDCC4EC)),
-              ),
-              const SizedBox(height: 48),
-              FilledButton(
-                onPressed: busy ? null : () => enter(devAuth),
-                child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Text(
-                    busy
-                        ? 'Подождите…'
-                        : devAuth
-                        ? 'Войти без Яндекса'
-                        : 'Войти через Яндекс ID',
-                  ),
-                ),
-              ),
-              TextButton(
-                onPressed: busy ? null : () => widget.api.enterLocalMode(),
-                child: const Text('Продолжить без интернета'),
-              ),
-              const Text(
-                'Без входа подписки хранятся только на этом устройстве.',
-                textAlign: TextAlign.center,
-                style: TextStyle(color: Colors.white54),
-              ),
-              if (devAuth && yandexClientId.isNotEmpty)
-                TextButton(
-                  onPressed: busy ? null : () => enter(false),
-                  child: const Text('Войти через Яндекс ID'),
-                ),
-              if (yandexClientId.isEmpty && !devAuth)
-                const Padding(
-                  padding: EdgeInsets.only(top: 18),
-                  child: Text(
-                    'Для реального входа задайте YANDEX_CLIENT_ID при сборке.',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(color: Colors.white54),
-                  ),
-                ),
-            ],
+            ),
           ),
         ),
       ),
@@ -272,15 +452,12 @@ class _HomePageState extends State<HomePage> {
                   await showSettings(context, widget.api);
                   break;
                 case 'login':
-                  try {
-                    if (devAuth) {
-                      await widget.api.loginDev();
-                    } else {
-                      await widget.api.loginYandex();
-                    }
-                  } catch (error) {
-                    if (context.mounted) errorSnack(context, error);
-                  }
+                  await Navigator.of(context).push<void>(
+                    MaterialPageRoute(
+                      builder: (_) =>
+                          LoginPage(api: widget.api, reauthenticate: true),
+                    ),
+                  );
                   break;
                 case 'logout':
                   try {
@@ -291,12 +468,22 @@ class _HomePageState extends State<HomePage> {
                   break;
               }
             },
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: 'manual', child: Text('Добавить вручную')),
-              PopupMenuItem(value: 'connect', child: Text('Подключить сервис')),
-              PopupMenuItem(value: 'settings', child: Text('Уведомления')),
-              PopupMenuItem(value: 'login', child: Text('Войти в аккаунт')),
-              PopupMenuItem(value: 'logout', child: Text('Выйти')),
+            itemBuilder: (_) => [
+              const PopupMenuItem(
+                value: 'manual',
+                child: Text('Добавить вручную'),
+              ),
+              const PopupMenuItem(
+                value: 'connect',
+                child: Text('Подключить сервис'),
+              ),
+              const PopupMenuItem(
+                value: 'settings',
+                child: Text('Уведомления'),
+              ),
+              if (widget.api.needsSignIn)
+                const PopupMenuItem(value: 'login', child: Text('Войти снова')),
+              const PopupMenuItem(value: 'logout', child: Text('Выйти')),
             ],
           ),
         ],
@@ -582,14 +769,12 @@ class SubscriptionsPage extends StatelessWidget {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        if (api.localOnly)
-          const Padding(
-            padding: EdgeInsets.only(bottom: 8),
-            child: Text(
-              'Локальный режим: подписки остаются на этом устройстве и не переносятся в аккаунт автоматически.',
-            ),
-          ),
-        if (api.offline)
+        if (api.needsSignIn)
+          const Text(
+            'Войдите снова через меню, чтобы синхронизировать изменения',
+            style: TextStyle(color: Colors.orangeAccent),
+          )
+        else if (api.offline)
           const Text(
             'Офлайн: можно добавлять и изменять подписки',
             style: TextStyle(color: Colors.orangeAccent),

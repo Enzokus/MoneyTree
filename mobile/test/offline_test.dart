@@ -28,37 +28,28 @@ void main() {
   });
 
   test(
-    'Local first launch, edits, reminders and restart need no server',
+    'First launch needs sign-in, even with data from an old guest session',
     () async {
-      var requests = 0;
-      final api = ApiClient(
-        client: MockClient((_) async {
-          requests++;
-          throw http.ClientException('offline');
+      SharedPreferences.setMockInitialValues({
+        'local_mode': true,
+        'offline_guest_v1': jsonEncode({
+          'subscriptions': [subscription],
         }),
-      );
-      await api.init();
-      await api.enterLocalMode();
-      await api.saveSubscription(subscription);
-      final id = api.subscriptions.single['id'] as String;
-      await api.saveSubscription({...subscription, 'name': 'Updated'}, id: id);
-      await api.saveReminders({
-        'hour': 9,
-        'minute': 15,
-        'days_before': [1],
       });
-      expect(api.pendingCount, 0);
-      api.dispose();
-      final restored = ApiClient();
-      addTearDown(restored.dispose);
-      await restored.init();
-      expect(restored.canOpen, isTrue);
-      expect(restored.localOnly, isTrue);
-      expect(restored.subscriptions.single['name'], 'Updated');
-      expect(restored.profile!['reminders']['hour'], 9);
-      await restored.removeSubscription(id);
-      expect(restored.subscriptions, isEmpty);
-      expect(requests, 0);
+      final api = ApiClient(
+        client: MockClient((_) async => throw http.ClientException('offline')),
+      );
+      addTearDown(api.dispose);
+      await api.init();
+      expect(api.canOpen, isFalse);
+      expect(api.subscriptions, isEmpty);
+      await expectLater(
+        api.loginWithPassword('+79870000001', 'password'),
+        throwsA(isA<ApiException>()),
+      );
+      expect(api.canOpen, isFalse);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString('offline_guest_v1'), isNotNull);
     },
   );
 
@@ -136,25 +127,58 @@ void main() {
     },
   );
 
-  test('Guest data remains separate from account data', () async {
-    final guest = ApiClient();
-    await guest.init();
-    await guest.enterLocalMode();
-    await guest.saveSubscription(subscription);
-    await guest.logout();
-    guest.dispose();
-    FlutterSecureStorage.setMockInitialValues({
-      'access': access('bob'),
-      'refresh': 'refresh',
-    });
-    final account = ApiClient(
-      client: MockClient((_) async => throw http.ClientException('offline')),
-    );
-    addTearDown(account.dispose);
-    await account.init();
-    expect(account.subscriptions, isEmpty);
-    await settle();
-    final prefs = await SharedPreferences.getInstance();
-    expect(prefs.getString('offline_guest_v1'), isNotNull);
-  });
+  test(
+    'Reauthentication preserves the queue and requires the same account',
+    () async {
+      FlutterSecureStorage.setMockInitialValues({
+        'access': access('alice'),
+        'refresh': 'expired',
+      });
+      var acceptedUser = 'bob';
+      var authenticated = false;
+      final sent = <dynamic>[];
+      final api = ApiClient(
+        client: MockClient((request) async {
+          if (request.url.path == '/auth/login') {
+            expect(jsonDecode(request.body), {
+              'identifier': '+79870000001',
+              'password': 'password',
+            });
+            authenticated = acceptedUser == 'alice';
+            return http.Response(
+              jsonEncode({
+                'access_token': access(acceptedUser),
+                'refresh_token': 'renewed',
+              }),
+              200,
+            );
+          }
+          if (!authenticated) return http.Response('{}', 401);
+          if (request.url.path == '/subscriptions' &&
+              request.method == 'POST') {
+            sent.add(jsonDecode(request.body));
+          }
+          if (request.url.path == '/me') return http.Response('{}', 200);
+          return http.Response(jsonEncode(sent), 200);
+        }),
+      );
+      addTearDown(api.dispose);
+      await api.init();
+      await settle();
+      expect(api.needsSignIn, isTrue);
+      await api.saveSubscription(subscription);
+      expect(api.pendingCount, 1);
+      await expectLater(
+        api.loginWithPassword('+79870000001', 'password'),
+        throwsA(isA<ApiException>()),
+      );
+      expect(api.pendingCount, 1);
+      expect(sent, isEmpty);
+      acceptedUser = 'alice';
+      await api.loginWithPassword('+79870000001', 'password');
+      expect(api.needsSignIn, isFalse);
+      expect(api.pendingCount, 0);
+      expect(sent.single['name'], 'Music');
+    },
+  );
 }
