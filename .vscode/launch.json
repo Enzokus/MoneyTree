@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Денежное дерево — разработка",
+      "type": "dart",
+      "request": "launch",
+      "program": "${workspaceFolder}/mobile/lib/main.dart",
+      "cwd": "${workspaceFolder}/mobile",
+      "flutterMode": "debug",
+      "toolArgs": [
+        "--dart-define=DEV_AUTH=true",
+        "--dart-define=API_BASE_URL=http://10.0.2.2:8000"
+      ]
+    }
+  ]
+}

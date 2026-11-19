@@ -1,0 +1,39 @@
+# Local configuration and data
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+/catalog.json
+
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Local editor settings. Keep the shared launch profiles.
+.idea/
+**/.vscode/*
+!**/.vscode/launch.json
+
+# Android outputs and signing files
+*.apk
+*.aab
+*.jks
+*.keystore
+key.properties
+
+# Presentation intermediates and manual test outputs
+/.deck-build/
+*.log
+/input-check.png
+/input-verify.png
+/keyboard-settings.png
+/phone-online-check.png
+/startup-check.png
