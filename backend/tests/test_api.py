@@ -215,21 +215,38 @@ def test_subscription_intake_keeps_selected_metadata_and_reuses_duplicates():
     assert any(s['name'] == 'Яндекс Плюс' and s['icon'] == 'music' for s in services)
     payload = {'name': 'Yandex Plus', 'plan_name': 'intake test', 'amount': '99',
                'period': 'daily', 'next_charge_date': '2099-03-29', 'source': 'statement',
-               'bank_name': 'Сбербанк', 'last_payment_date': '2099-03-28'}
+               'bank_name': 'ВТБ', 'bank_merchant': 'YANDEX*PLUS', 'last_payment_date': '2099-03-28'}
     first = client.post('/subscriptions', json=payload, headers=auth)
     assert first.status_code == 201
     row = first.json()
     try:
         assert row['source'] == 'statement'
-        assert row['bank_name'] == 'Сбербанк'
+        assert row['bank_name'] == 'ВТБ'
+        assert row['bank_merchant'] == 'YANDEX*PLUS'
         assert row['last_payment_date'] == '2099-03-28'
         assert row['period'] == 'daily'
         duplicate = client.post('/subscriptions', headers=auth,
                                 json={**payload, 'name': 'Яндекс Плюс', 'source': 'manual'})
         assert duplicate.json()['id'] == row['id']
+        edit = {k: v for k, v in payload.items() if k not in ('bank_name', 'last_payment_date', 'bank_merchant')}
         edited = client.put('/subscriptions/' + row['id'], headers=auth,
-                            json={k: v for k, v in payload.items() if k not in ('bank_name', 'last_payment_date')})
+                            json={**edit, 'name': 'Моя подписка'})
         assert edited.json()['last_payment_date'] == '2099-03-28'
         assert edited.json()['source'] == 'statement'
+        assert edited.json()['bank_merchant'] == 'YANDEX*PLUS'
     finally:
         client.delete('/subscriptions/' + row['id'], headers=auth)
+
+
+def test_bank_merchant_migration_preserves_existing_details():
+    from sqlalchemy import create_engine
+    from app.db import upgrade_subscription_details
+
+    database = create_engine('sqlite://')
+    with database.begin() as conn:
+        conn.exec_driver_sql('CREATE TABLE subscription_details (subscription_id VARCHAR PRIMARY KEY, bank_name VARCHAR)')
+        conn.exec_driver_sql("INSERT INTO subscription_details VALUES ('old', 'ВТБ')")
+    upgrade_subscription_details(database)
+    upgrade_subscription_details(database)
+    with database.connect() as conn:
+        assert conn.exec_driver_sql('SELECT bank_name, bank_merchant FROM subscription_details').one() == ('ВТБ', None)

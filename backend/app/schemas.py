@@ -31,6 +31,7 @@ class SubscriptionInput(BaseModel):
     timezone: str = 'Europe/Moscow'
     status: Status = 'active'
     bank_name: str | None = Field(default=None, max_length=80)
+    bank_merchant: str | None = Field(default=None, max_length=300)
     last_payment_date: date | None = None
 
 

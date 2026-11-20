@@ -27,6 +27,43 @@ void main() {
     await initializeDateFormatting('ru');
   });
 
+  testWidgets(
+    'Shows the original descriptor and clears the fallback on focus',
+    (tester) async {
+      final api = ApiClient();
+      addTearDown(api.dispose);
+      Future<void> open(String title) => tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SubscriptionForm(
+              key: ValueKey(title),
+              api: api,
+              draft: {'name': title, 'bank_merchant': 'BANK*STREAM'},
+            ),
+          ),
+        ),
+      );
+      await open('Стриминг');
+      expect(find.text('Стриминг'), findsOneWidget);
+      expect(find.text('BANK*STREAM'), findsOneWidget);
+
+      await open('BANK*STREAM');
+      final field = find.byType(TextField).first;
+      TextField input() => tester.widget<TextField>(field);
+      expect(input().decoration!.hintText, 'BANK*STREAM');
+      expect(input().controller!.text, isEmpty);
+      await tester.tap(field);
+      await tester.pump();
+      expect(input().focusNode!.hasFocus, isTrue);
+      expect(input().decoration!.hintText, isNull);
+      expect(input().controller!.text, isEmpty);
+      await tester.enterText(field, 'Мой сервис');
+      await tester.pump();
+      expect(find.text('Мой сервис'), findsOneWidget);
+      expect(find.text('BANK*STREAM'), findsOneWidget);
+    },
+  );
+
   test('Includes today and the last day in 28, 29, 30 and 31 day months', () {
     for (final now in [
       DateTime(2026, 2, 14),

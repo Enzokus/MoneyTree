@@ -39,7 +39,36 @@ void main() {
       expect(result.kind, CandidateKind.recognized);
       expect(result.period, 'monthly');
       expect(result.latest.kopecks, 29900);
+      expect(result.draft()['bank_merchant'], 'YANDEX*PLUS');
       expect(result.predictedDate, DateTime.utc(2026, 4, 30));
+    },
+  );
+
+  test(
+    'Recognizes a bank notification and preserves its original descriptor',
+    () {
+      final draft = sharedSubscriptionDraft(
+        'Покупка 399 ₽ YM*YANDEX.PLUS. Карта **1234',
+        directory,
+      );
+      expect(draft['name'], 'Яндекс Плюс');
+      expect(draft['bank_merchant'], 'YM*YANDEX.PLUS');
+
+      final unknown = sharedSubscriptionDraft(
+        'Торговая точка: PAY*MYVPN\nСумма: 300 ₽',
+        directory,
+      );
+      expect(unknown['name'], 'PAY*MYVPN');
+      expect(unknown['bank_merchant'], 'PAY*MYVPN');
+      final descriptorOnly = sharedSubscriptionDraft('PAY*MYVPN', directory);
+      expect(descriptorOnly['name'], 'PAY*MYVPN');
+      expect(descriptorOnly['bank_merchant'], 'PAY*MYVPN');
+      final explicitService = sharedSubscriptionDraft(
+        'Сервис: Мой VPN\nТорговая точка: PAY*MYVPN',
+        directory,
+      );
+      expect(explicitService['name'], 'Мой VPN');
+      expect(explicitService['bank_merchant'], 'PAY*MYVPN');
     },
   );
 

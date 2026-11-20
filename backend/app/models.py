@@ -77,6 +77,7 @@ class SubscriptionDetails(Base):
     __tablename__ = 'subscription_details'
     subscription_id: Mapped[str] = mapped_column(ForeignKey('subscriptions.id'), primary_key=True)
     bank_name: Mapped[str | None] = mapped_column(String(80))
+    bank_merchant: Mapped[str | None] = mapped_column(String(300))
     last_payment_date: Mapped[date | None] = mapped_column(Date)
 
 

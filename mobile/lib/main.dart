@@ -328,9 +328,7 @@ class _LoginPageState extends State<LoginPage> {
                       },
                       decoration: InputDecoration(
                         labelText: 'Пароль',
-                        helperText: _registering
-                            ? 'Минимум 12 символов'
-                            : null,
+                        helperText: _registering ? 'Минимум 12 символов' : null,
                         suffixIcon: IconButton(
                           tooltip: _showPassword
                               ? 'Скрыть пароль'
@@ -833,6 +831,7 @@ class _SubscriptionsPageState extends State<SubscriptionsPage> {
               row['plan_name'],
               row['category'],
               row['bank_name'],
+              row['bank_merchant'],
               ...?service?.aliases,
             ].whereType<String>().join(' '),
           );
@@ -1273,10 +1272,24 @@ class SubscriptionForm extends StatefulWidget {
 class _SubscriptionFormState extends State<SubscriptionForm> {
   final formKey = GlobalKey<FormState>();
   Map<String, dynamic>? get initial => widget.existing ?? widget.draft;
+  late final bankMerchant = initial?['bank_merchant']?.toString().trim() ?? '';
+  late final fallbackName = limitText(bankMerchant, 120);
   late var service = widget.api.services.lookup(initial?['name']?.toString());
   late final name = TextEditingController(
-    text: initial?['name']?.toString() ?? '',
+    text: initial?['name'] == fallbackName
+        ? ''
+        : initial?['name']?.toString() ?? '',
   );
+  late final nameFocus = FocusNode()..addListener(updateNameFocus);
+  void updateNameFocus() {
+    if (!nameFocus.hasFocus &&
+        name.text.trim().isEmpty &&
+        name.text.isNotEmpty) {
+      name.clear();
+    }
+    setState(() {});
+  }
+
   late final plan = TextEditingController(
     text: initial?['plan_name']?.toString() ?? '',
   );
@@ -1308,6 +1321,7 @@ class _SubscriptionFormState extends State<SubscriptionForm> {
   @override
   void dispose() {
     name.dispose();
+    nameFocus.dispose();
     plan.dispose();
     category.dispose();
     amount.dispose();
@@ -1325,7 +1339,9 @@ class _SubscriptionFormState extends State<SubscriptionForm> {
     try {
       await ReminderService.instance.updateTimeZone();
       await widget.api.saveSubscription({
-        'name': service?.name ?? name.text.trim(),
+        'name': name.text.trim().isEmpty
+            ? fallbackName
+            : service?.name ?? name.text.trim(),
         'plan_name': plan.text.trim().isEmpty ? null : plan.text.trim(),
         'category': category.text.trim().isEmpty
             ? null
@@ -1339,6 +1355,7 @@ class _SubscriptionFormState extends State<SubscriptionForm> {
         'status': status,
         'source': initial?['source'] ?? 'manual',
         'bank_name': bank.text.trim().isEmpty ? null : bank.text.trim(),
+        if (bankMerchant.isNotEmpty) 'bank_merchant': bankMerchant,
         if (initial?['last_payment_date'] != null)
           'last_payment_date': initial!['last_payment_date'],
       }, id: widget.existing?['id']?.toString());
@@ -1413,19 +1430,41 @@ class _SubscriptionFormState extends State<SubscriptionForm> {
               const SizedBox(height: 18),
               TextFormField(
                 controller: name,
+                focusNode: nameFocus,
                 hintLocales: const [Locale('ru'), Locale('en')],
                 maxLength: 120,
                 decoration: InputDecoration(
                   labelText: 'Сервис',
+                  floatingLabelBehavior: fallbackName.isEmpty
+                      ? FloatingLabelBehavior.auto
+                      : FloatingLabelBehavior.always,
                   counterText: '',
+                  hintText:
+                      fallbackName.isNotEmpty &&
+                          !nameFocus.hasFocus &&
+                          name.text.isEmpty
+                      ? fallbackName
+                      : null,
+                  hintStyle: Theme.of(context).textTheme.bodyLarge,
                   prefixIcon: service == null
                       ? null
                       : Icon(serviceIcon(service!.icon)),
                 ),
                 onChanged: updateService,
                 validator: (v) =>
-                    v == null || v.trim().isEmpty ? 'Укажите сервис' : null,
+                    (v?.trim().isEmpty ?? true) && fallbackName.isEmpty
+                    ? 'Укажите сервис'
+                    : null,
               ),
+              if (bankMerchant.isNotEmpty &&
+                  (name.text.isNotEmpty || nameFocus.hasFocus))
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+                  child: Text(
+                    bankMerchant,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ),
               if (suggestions.isNotEmpty)
                 Wrap(
                   spacing: 6,

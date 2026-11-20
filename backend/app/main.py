@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from .billing import monthly_equivalent, upcoming
 from .config import settings
-from .db import Base, engine, get_db
+from .db import Base, engine, get_db, upgrade_subscription_details
 from .models import CatalogPlan, PasswordLogin, RefreshSession, Service, Subscription, SubscriptionDetails, User
 from .passwords import DEV_USER_ID, normalize_ru_phone, seed_dev_account, verify_password
 from .registration import register_user
@@ -26,6 +26,7 @@ from .services import same_subscription, seed_services, service_aliases, service
 if len(settings.jwt_secret) < 32 or settings.jwt_secret.startswith('replace_with_'):
     raise RuntimeError('JWT_SECRET must contain at least 32 characters')
 Base.metadata.create_all(engine)
+upgrade_subscription_details()
 seed_services()
 if settings.allow_dev_auth:
     seed_dev_account()
@@ -198,10 +199,14 @@ def reminders(body: ReminderSettings, user: CurrentUser, db: Db):
     return {'ok': True}
 
 
+SUBSCRIPTION_DETAILS = {'bank_name', 'bank_merchant', 'last_payment_date'}
+
+
 def subscription_payload(s: Subscription, device_timezone: str | None = None):
     payload = SubscriptionOut.model_validate(s).model_dump(mode='json')
     if s.details:
         payload['bank_name'] = s.details.bank_name
+        payload['bank_merchant'] = s.details.bank_merchant
         if s.details.last_payment_date:
             payload['last_payment_date'] = s.details.last_payment_date.isoformat()
     try:
@@ -226,7 +231,7 @@ def list_subscriptions(user: CurrentUser, db: Db, timezone: str | None = None):
 @app.post('/subscriptions', status_code=201)
 def create_subscription(body: SubscriptionCreate, user: CurrentUser, db: Db):
     rows = locked_subscriptions(db, user)
-    data = body.model_dump(exclude={'id', 'bank_name', 'last_payment_date'})
+    data = body.model_dump(exclude={'id', *SUBSCRIPTION_DETAILS})
     if body.id is not None:
         existing = db.get(Subscription, str(body.id))
         if existing:
@@ -260,10 +265,10 @@ def locked_subscriptions(db: Session, user: User):
 
 
 def update_subscription_details(s: Subscription, body: SubscriptionInput):
-    if not s.details and (body.bank_name or body.last_payment_date):
+    if not s.details and any(getattr(body, field) is not None for field in SUBSCRIPTION_DETAILS):
         s.details = SubscriptionDetails()
     if s.details:
-        for field in ('bank_name', 'last_payment_date'):
+        for field in SUBSCRIPTION_DETAILS:
             if field in body.model_fields_set:
                 setattr(s.details, field, getattr(body, field))
 
@@ -276,7 +281,7 @@ def update_subscription(subscription_id: str, body: SubscriptionInput, user: Cur
     for other in rows:
         if other.id != s.id and same_subscription(other, body, aliases) and not same_subscription(other, s, aliases):
             raise HTTPException(409, 'Subscription already exists')
-    data = body.model_dump(exclude={'bank_name', 'last_payment_date'})
+    data = body.model_dump(exclude=SUBSCRIPTION_DETAILS)
     data['anchor_day'] = body.anchor_day or body.next_charge_date.day
     for key, value in data.items():
         setattr(s, key, value)

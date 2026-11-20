@@ -8,7 +8,9 @@ import 'subscription_intake.dart';
 
 enum StatementBank {
   sber('Сбербанк'),
-  tbank('Т-Банк');
+  tbank('Т-Банк'),
+  vtb('ВТБ'),
+  alfa('Альфа-Банк');
 
   const StatementBank(this.label);
   final String label;
@@ -90,7 +92,11 @@ class _Line {
   }
 }
 
-List<_Line> _orderedLines(PdfPageRawText pageText, double width) {
+List<_Line> _orderedLines(
+  PdfPageRawText pageText,
+  double width, {
+  double tolerance = 5.2,
+}) {
   final glyphs = <_Glyph>[];
   for (
     var i = 0;
@@ -110,7 +116,7 @@ List<_Line> _orderedLines(PdfPageRawText pageText, double width) {
   final lines = <_Line>[];
   for (final glyph in glyphs) {
     // PDFium reports glyph bounds. Punctuation and digits on one row have different bottoms.
-    if (lines.isEmpty || (lines.last.y - glyph.y).abs() > 5.2) {
+    if (lines.isEmpty || (lines.last.y - glyph.y).abs() > tolerance) {
       lines.add(_Line(glyph.y));
     }
     lines.last.glyphs.add(glyph);
@@ -126,7 +132,7 @@ String statementFingerprint(Uint8List bytes) =>
 
 final _operationTime = RegExp(r'\d{2}:\d{2}');
 final _bankAmount = RegExp(
-  r'^([+−-])?\s*([\d ]+[,.]\d{2})\s*(₽|RUB|\$|USD|€|EUR)?$',
+  r'^([+−-])?\s*([\d ]+[,.]\d{2})\s*(₽|RUB|RUR|\$|USD|€|EUR)?$',
   caseSensitive: false,
 );
 final _ignoredOperation = RegExp(
@@ -148,19 +154,55 @@ String _merchant(String description) => description
     .trim()
     .replaceFirst(RegExp(r'[.,;:]+$'), '');
 
-String _description(List<_Line> lines, int index, double left) {
-  const right = 385.0;
+String _description(
+  List<_Line> lines,
+  int index,
+  double left, {
+  double right = 385,
+  bool hasTrailingColumn = false,
+}) {
   final value = StringBuffer(lines[index].between(left, right));
   for (var i = index + 1; i < lines.length && i <= index + 3; i++) {
     final line = lines[i];
     if (line.between(0, left).isNotEmpty ||
-        line.between(right).isNotEmpty ||
+        (!hasTrailingColumn && line.between(right).isNotEmpty) ||
         (lines[i - 1].y - line.y) > 15) {
       break;
     }
     value.write(' ${line.between(left, right)}');
   }
   return value.toString();
+}
+
+final _accountAdjustment = RegExp(
+  r'^(?:комиссия|выплата)(?![а-яёa-z])|^плата\s+за\s+(?:ведение|обслуживание)|'
+  r'погашение\s|задолженност|банковских услуг|'
+  r'внутренн(?:ий|яя)\s+(?:перевод|операция)',
+  caseSensitive: false,
+  unicode: true,
+);
+
+String _accountMerchant(String description) {
+  final sbp = RegExp(
+    r'^плат[её]ж\s+\S+\s+в\s+(.+?)\s+через\s+систему\s+быстрых\s+платежей',
+    caseSensitive: false,
+  ).firstMatch(description);
+  final cleaned = (sbp?[1] ?? description)
+      .replaceFirst(
+        RegExp(
+          r'^(?:покупка|оплата)(?:\s+(?:по карте|товаров и услуг))?[.: ]+',
+          caseSensitive: false,
+        ),
+        '',
+      )
+      .split(
+        RegExp(
+          r'[.;]?\s+(?:MCC\b|МСС\s*[:=]|по карте\s+\*|дата операции\s*[:=])',
+          caseSensitive: false,
+        ),
+      )
+      .first;
+  return _merchant(cleaned);
 }
 
 Future<BankStatement> readBankStatement(Uint8List bytes) async {
@@ -190,22 +232,44 @@ Future<BankStatement> readBankStatement(Uint8List bytes) async {
       final h when h.contains('выпискаподоговору') && h.contains('балансна') =>
         StatementBank.tbank,
       final h
+          when h.contains('периодвыписки') &&
+              h.contains('датаобработки') &&
+              h.contains('приходрасход') =>
+        StatementBank.vtb,
+      final h
           when h.contains('выписка') &&
               (h.contains('сбербанк') ||
                   h.contains('sberbankru') ||
                   h.contains('сберкарт')) =>
         StatementBank.sber,
+      final h
+          when h.contains('выпискапосчету') &&
+              h.contains('запериодс') &&
+              h.contains('операциипосчету') &&
+              normalizedService(firstText?.fullText)
+                  .replaceAll(' ', '')
+                  .contains('альфабанк') =>
+        StatementBank.alfa,
       _ => throw const FormatException(
-        'Формат выписки не распознан. Выберите текстовую PDF-выписку Сбера или Т-Банка.',
+        'Выберите текстовую PDF-выписку Сбера, Т-Банка, ВТБ или Альфа-Банка.',
       ),
     };
     final sber = bank == StatementBank.sber;
+    final vtb = bank == StatementBank.vtb;
+    final alfa = bank == StatementBank.alfa;
+    final accountStatement = vtb || alfa;
+    final periodHeading = switch (bank) {
+      StatementBank.tbank => 'балансна',
+      StatementBank.vtb => 'периодвыписки',
+      _ => 'запериод',
+    };
     final coverage =
-        header
+        [...header, ...rawHeader.split('\n')]
             .where(
-              (line) => line.toLowerCase().startsWith(
-                sber ? 'за период' : 'баланс на',
-              ),
+              (line) =>
+                  normalizedService(line)
+                      .replaceAll(' ', '')
+                      .startsWith(periodHeading),
             )
             .expand(printedDate.allMatches)
             .map(parsePrintedDate)
@@ -225,11 +289,13 @@ Future<BankStatement> readBankStatement(Uint8List bytes) async {
     for (final page in document.pages) {
       final List<_Line> lines;
       if (page.pageNumber == 1) {
-        lines = firstLines;
+        lines = vtb
+            ? _orderedLines(firstText!, page.width, tolerance: 6.5)
+            : firstLines;
       } else {
         final text = await page.loadText();
         if (text == null) continue;
-        lines = _orderedLines(text, page.width);
+        lines = _orderedLines(text, page.width, tolerance: vtb ? 6.5 : 5.2);
       }
       for (var i = 0; i < lines.length; i++) {
         final line = lines[i];
@@ -240,25 +306,40 @@ Future<BankStatement> readBankStatement(Uint8List bytes) async {
         ).firstMatch(full);
         if (cardHeader != null) card = cardHeader[1]!.replaceAll(' ', '');
         final date = parsePrintedDate(
-          printedDate.matchAsPrefix(line.between(30, 90)),
+          printedDate.matchAsPrefix(
+            line.between(
+              accountStatement ? 20 : 30,
+              accountStatement ? 85 : 90,
+            ),
+          ),
         );
         if (date == null) continue;
         final timing = line.between(90, sber ? 145 : 205);
         final time =
             _operationTime.stringMatch(sber ? timing : line.between(30, 130)) ??
             '';
-        if (sber ? time.isEmpty : printedDate.firstMatch(timing) == null) {
+        if ((sber && time.isEmpty) ||
+            (bank == StatementBank.tbank &&
+                printedDate.firstMatch(timing) == null) ||
+            (vtb && printedDate.firstMatch(line.between(86, 150)) == null)) {
           continue;
         }
-        final value = _bankAmount.firstMatch(
-          sber ? line.between(385, 486) : line.between(480, 550),
-        );
+        final value = _bankAmount.firstMatch(switch (bank) {
+          StatementBank.sber => line.between(385, 486),
+          StatementBank.tbank => line.between(480, 550),
+          StatementBank.vtb => line.between(310, 390),
+          StatementBank.alfa => line.between(500, 575),
+        });
         if (value == null) continue;
         recognized = true;
         if (lastOperation == null || date.isAfter(lastOperation)) {
           lastOperation = date;
         }
-        if (value[1] == '+') continue;
+        if (accountStatement
+            ? value[1] != '-' && value[1] != '−'
+            : value[1] == '+') {
+          continue;
+        }
         final number = value[2]!.replaceAll(RegExp(r'[ ,.]+'), '');
         final cents = int.tryParse(number);
         if (cents == null || cents <= 0) continue;
@@ -278,11 +359,27 @@ Future<BankStatement> readBankStatement(Uint8List bytes) async {
           description = _description(lines, i + 1, 145);
           paymentCard =
               RegExp(r'\*{2,}(\d{4})').firstMatch(description)?[1] ?? '';
+        } else if (vtb) {
+          description = _description(
+            lines,
+            i,
+            390,
+            right: 500,
+            hasTrailingColumn: true,
+          );
+        } else if (alfa) {
+          authorization = line.between(92, 183).replaceAll(' ', '');
+          description = _description(lines, i, 184, right: 500);
         } else {
           description = _description(lines, i, 205);
         }
         if (_ignoredOperation.hasMatch('$category $description')) continue;
-        final merchant = _merchant(description);
+        if (accountStatement && _accountAdjustment.hasMatch(description)) {
+          continue;
+        }
+        final merchant = accountStatement
+            ? _accountMerchant(description)
+            : _merchant(description);
         if (normalizedService(merchant).isEmpty) continue;
         final currency = switch (value[3]?.toUpperCase()) {
           'USD' || '\$' => 'USD',
@@ -353,7 +450,7 @@ class StatementCandidate {
   final CandidateKind kind;
   final String? period;
   final int count, anchorDay;
-  String get name => service?.name ?? latest.merchant;
+  String get name => service?.name ?? limitText(latest.merchant, 120);
   DateTime? get predictedDate =>
       period == null ? null : advanceCharge(latest.date, period!, anchorDay);
 
@@ -368,6 +465,7 @@ class StatementCandidate {
       'amount': (latest.kopecks / 100).toStringAsFixed(2),
       'currency': latest.currency,
       'bank_name': latest.bank.label,
+      'bank_merchant': limitText(latest.merchant, 300),
       'last_payment_date': isoDay(latest.date),
       'source': 'statement',
       'period': ?period,

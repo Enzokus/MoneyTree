@@ -62,6 +62,9 @@ void main() {
     await api.addStatement(
       BankStatement(StatementBank.sber, DateTime.utc(2026, 4, 12), 'old', []),
     );
+    await api.addStatement(
+      BankStatement(StatementBank.vtb, DateTime.utc(2026, 4, 18), 'vtb', []),
+    );
     expect(requests.every((request) => request.method == 'GET'), isTrue);
     api.dispose();
 
@@ -74,6 +77,27 @@ void main() {
     expect(restored.statementPayments.single.key, payment.key);
     expect(
       restored.statementDates[StatementBank.sber],
+      DateTime.utc(2026, 4, 17),
+    );
+    final uploads = restored.statementUploadDates;
+    expect(
+      uploads.keys,
+      unorderedEquals([StatementBank.sber, StatementBank.vtb]),
+    );
+    await restored.clearStatementResults();
+    expect(restored.hasStatementResults, isFalse);
+    expect(restored.statementPayments, isEmpty);
+    expect(restored.importedStatement('pdf-1'), isFalse);
+
+    final afterClear = ApiClient(
+      client: MockClient((_) async => throw http.ClientException('offline')),
+    );
+    addTearDown(afterClear.dispose);
+    await afterClear.init();
+    expect(afterClear.hasStatementResults, isFalse);
+    expect(afterClear.statementUploadDates, uploads);
+    expect(
+      afterClear.statementDates[StatementBank.sber],
       DateTime.utc(2026, 4, 17),
     );
   });
@@ -178,43 +202,49 @@ void main() {
     },
   );
 
-  test('Account deletion clears local data only after server confirmation', () async {
-    FlutterSecureStorage.setMockInitialValues({
-      'access': access('alice'),
-      'refresh': 'refresh',
-    });
-    var acceptDeletion = false;
-    final api = ApiClient(
-      client: MockClient((request) async {
-        if (request.method == 'DELETE' && request.url.path == '/me') {
-          expect(request.headers['authorization'], 'Bearer ${access('alice')}');
-          if (acceptDeletion) return http.Response('{"ok":true}', 200);
-        }
-        throw http.ClientException('offline');
-      }),
-    );
-    addTearDown(api.dispose);
-    await api.init();
-    await api.reload();
-    await api.saveSubscription(subscription);
-    await api.reload();
+  test(
+    'Account deletion clears local data only after server confirmation',
+    () async {
+      FlutterSecureStorage.setMockInitialValues({
+        'access': access('alice'),
+        'refresh': 'refresh',
+      });
+      var acceptDeletion = false;
+      final api = ApiClient(
+        client: MockClient((request) async {
+          if (request.method == 'DELETE' && request.url.path == '/me') {
+            expect(
+              request.headers['authorization'],
+              'Bearer ${access('alice')}',
+            );
+            if (acceptDeletion) return http.Response('{"ok":true}', 200);
+          }
+          throw http.ClientException('offline');
+        }),
+      );
+      addTearDown(api.dispose);
+      await api.init();
+      await api.reload();
+      await api.saveSubscription(subscription);
+      await api.reload();
 
-    await expectLater(api.deleteAccount(), throwsA(isA<ApiException>()));
-    expect(api.signedIn, isTrue);
-    expect(api.pendingCount, 1);
-    final prefs = await SharedPreferences.getInstance();
-    expect(prefs.getString('offline_account_v1_alice'), isNotNull);
+      await expectLater(api.deleteAccount(), throwsA(isA<ApiException>()));
+      expect(api.signedIn, isTrue);
+      expect(api.pendingCount, 1);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString('offline_account_v1_alice'), isNotNull);
 
-    acceptDeletion = true;
-    await api.deleteAccount();
-    expect(api.signedIn, isFalse);
-    expect(api.subscriptions, isEmpty);
-    expect(api.pendingCount, 0);
-    expect(prefs.getString('offline_account_v1_alice'), isNull);
-    const storage = FlutterSecureStorage();
-    expect(await storage.read(key: 'access'), isNull);
-    expect(await storage.read(key: 'refresh'), isNull);
-  });
+      acceptDeletion = true;
+      await api.deleteAccount();
+      expect(api.signedIn, isFalse);
+      expect(api.subscriptions, isEmpty);
+      expect(api.pendingCount, 0);
+      expect(prefs.getString('offline_account_v1_alice'), isNull);
+      const storage = FlutterSecureStorage();
+      expect(await storage.read(key: 'access'), isNull);
+      expect(await storage.read(key: 'refresh'), isNull);
+    },
+  );
 
   test(
     'Reauthentication preserves the queue and requires the same account',

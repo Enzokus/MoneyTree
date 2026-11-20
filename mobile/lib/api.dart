@@ -70,11 +70,16 @@ class ApiClient extends ChangeNotifier {
   int _revision = 0;
   List<Map<String, dynamic>> _pending = [];
   Map<StatementBank, DateTime> _statementDates = {};
+  Map<StatementBank, DateTime> _statementUploadDates = {};
   Map<String, StatementPayment> _statementPayments = {};
   Set<String> _statementFiles = {};
 
   Map<StatementBank, DateTime> get statementDates =>
       Map.unmodifiable(_statementDates);
+  Map<StatementBank, DateTime> get statementUploadDates =>
+      Map.unmodifiable(_statementUploadDates);
+  bool get hasStatementResults =>
+      _statementFiles.isNotEmpty || _statementPayments.isNotEmpty;
   Iterable<StatementPayment> get statementPayments => _statementPayments.values;
   bool importedStatement(String fingerprint) =>
       _statementFiles.contains(fingerprint);
@@ -104,15 +109,39 @@ class ApiClient extends ChangeNotifier {
     final files = {..._statementFiles, statement.fingerprint};
     if (files.length > 128) files.remove(files.first);
     final previousDates = _statementDates;
+    final previousUploadDates = _statementUploadDates;
     final previousPayments = _statementPayments;
     final previousFiles = _statementFiles;
     _statementDates = dates;
+    _statementUploadDates = {
+      ..._statementUploadDates,
+      statement.bank: calendarDay(DateTime.now()),
+    };
     _statementPayments = payments;
     _statementFiles = files;
     try {
       await _persist();
     } catch (_) {
       _statementDates = previousDates;
+      _statementUploadDates = previousUploadDates;
+      _statementPayments = previousPayments;
+      _statementFiles = previousFiles;
+      rethrow;
+    }
+    notifyListeners();
+  }
+
+  Future<void> clearStatementResults() async {
+    if (_authenticating) {
+      throw const ApiException('Дождитесь завершения операции с аккаунтом.');
+    }
+    final previousPayments = _statementPayments;
+    final previousFiles = _statementFiles;
+    _statementPayments = {};
+    _statementFiles = {};
+    try {
+      await _persist();
+    } catch (_) {
       _statementPayments = previousPayments;
       _statementFiles = previousFiles;
       rethrow;
@@ -166,6 +195,10 @@ class ApiClient extends ChangeNotifier {
           for (final entry in _statementDates.entries)
             entry.key.name: isoDay(entry.value),
         },
+        'statement_upload_dates': {
+          for (final entry in _statementUploadDates.entries)
+            entry.key.name: isoDay(entry.value),
+        },
         'statement_payments': _statementPayments.values
             .map((p) => p.toJson())
             .toList(),
@@ -188,6 +221,7 @@ class ApiClient extends ChangeNotifier {
       profile = null;
       _pending = [];
       _statementDates = {};
+      _statementUploadDates = {};
       _statementPayments = {};
       _statementFiles = {};
       return;
@@ -200,12 +234,14 @@ class ApiClient extends ChangeNotifier {
         ? null
         : Map<String, dynamic>.from(data['profile']);
     _pending = _rows(data['pending'] ?? []);
-    _statementDates = {
-      for (final entry in (data['statement_dates'] as Map? ?? {}).entries)
+    Map<StatementBank, DateTime> readDates(String field) => {
+      for (final entry in (data[field] as Map? ?? {}).entries)
         StatementBank.values.byName(entry.key as String): calendarDay(
           DateTime.parse(entry.value as String),
         ),
     };
+    _statementDates = readDates('statement_dates');
+    _statementUploadDates = readDates('statement_upload_dates');
     _statementPayments = {
       for (final payment in (data['statement_payments'] as List? ?? []).map(
         (p) => StatementPayment.fromJson(p as List),
@@ -413,10 +449,7 @@ class ApiClient extends ChangeNotifier {
     return response;
   }
 
-  Future<Map<String, dynamic>> _rawPost(
-    String path,
-    Object body,
-  ) async {
+  Future<Map<String, dynamic>> _rawPost(String path, Object body) async {
     try {
       final response = await _client
           .post(
@@ -655,6 +688,7 @@ class ApiClient extends ChangeNotifier {
     catalog = [];
     _pending = [];
     _statementDates = {};
+    _statementUploadDates = {};
     _statementPayments = {};
     _statementFiles = {};
     await _storage.delete(key: 'access');

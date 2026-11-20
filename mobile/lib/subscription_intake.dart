@@ -1,11 +1,14 @@
 import 'dart:math' as math;
 
-final _nameWords = RegExp(r'[a-zа-я0-9]+');
+final _nameWords = RegExp(r'[a-zа-яё0-9]+', caseSensitive: false);
 
 String normalizedService(String? value) => _nameWords
     .allMatches((value ?? '').toLowerCase().replaceAll('ё', 'е'))
     .map((match) => match[0]!)
     .join(' ');
+
+String limitText(String value, int length) =>
+    String.fromCharCodes(value.runes.take(length));
 
 class SubscriptionService {
   SubscriptionService(Map<String, dynamic> row)
@@ -25,19 +28,43 @@ class ServiceDirectory {
   final List<SubscriptionService> services;
 
   SubscriptionService? lookup(String? input, {bool text = false}) {
+    if (text) return matchDescriptor(input)?.$1;
     final query = normalizedService(input);
     if (query.isEmpty) return null;
-    SubscriptionService? best;
-    var length = 0;
     for (final service in services) {
       for (final term in service.terms) {
         if (query == term) return service;
-        if (text &&
-            term.length > length &&
-            {'start', 'wink', 'premier'}.contains(term) == false &&
-            ' $query '.contains(' $term ')) {
-          best = service;
-          length = term.length;
+      }
+    }
+    return null;
+  }
+
+  (SubscriptionService, String)? matchDescriptor(String? value) {
+    if (value == null) return null;
+    final words = _nameWords.allMatches(value).toList();
+    final normalized = words.map((word) => normalizedService(word[0])).toList();
+    final query = normalized.join(' ');
+    (SubscriptionService, String)? best;
+    var longest = 0;
+    for (final service in services) {
+      for (final term in service.terms) {
+        if (term.isEmpty) continue;
+        if (term == query) return (service, value.trim());
+        if (term.length <= longest ||
+            {'start', 'wink', 'premier'}.contains(term) ||
+            !' $query '.contains(' $term ')) {
+          continue;
+        }
+        final count = term.split(' ').length;
+        for (var i = 0; i <= words.length - count; i++) {
+          if (normalized.skip(i).take(count).join(' ') == term) {
+            best = (
+              service,
+              value.substring(words[i].start, words[i + count - 1].end),
+            );
+            longest = term.length;
+            break;
+          }
         }
       }
     }
@@ -97,12 +124,14 @@ DateTime upcomingCharge(
   return date;
 }
 
-final printedDate = RegExp(r'(?<!\d)(\d{2})\.(\d{2})\.(\d{4}|\d{2})(?!\d)');
+final printedDate = RegExp(
+  r'(?<!\d)(\d\s*\d)\s*\.\s*(\d\s*\d)\s*\.\s*(\d{4}|\d{2})(?!\d)',
+);
 
 DateTime? parsePrintedDate(Match? match) {
   if (match == null) return null;
-  final day = int.parse(match[1]!);
-  final month = int.parse(match[2]!);
+  final day = int.parse(match[1]!.replaceAll(RegExp(r'\s'), ''));
+  final month = int.parse(match[2]!.replaceAll(RegExp(r'\s'), ''));
   final yearText = match[3]!;
   final year = int.parse(yearText) + (yearText.length == 2 ? 2000 : 0);
   final date = DateTime.utc(year, month, day);
@@ -132,6 +161,51 @@ String? _field(String text, String label) => RegExp(
   multiLine: true,
 ).firstMatch(text)?[1]?.trim();
 
+final _pricePattern = RegExp(
+  r'(?<![\d.,])([0-9]+(?:[ \u00a0\u202f][0-9]{3})*(?:[.,][0-9]{1,2})?)'
+  r'\s*(₽|руб(?:лей|ля|\.)?|RUB|USD|EUR|€|\$)(?![a-zа-я])',
+  caseSensitive: false,
+);
+
+String? _paymentNotificationMerchant(String text) {
+  final operation = RegExp(
+    r'^\s*(?:покупка|оплата|purchase)(?:\s+по карте)?\s*[: ]*([^\r\n]+)',
+    multiLine: true,
+    caseSensitive: false,
+  ).firstMatch(text)?[1];
+  if (operation == null) return null;
+  final price = _pricePattern.firstMatch(operation);
+  if (price == null) return null;
+  final suffix = operation.substring(price.end).trimLeft();
+  final prefix = operation.substring(0, price.start);
+  final merchant = (normalizedService(prefix).isEmpty ? suffix : prefix)
+      .replaceFirst(RegExp(r'^(?:в|у)\s+', caseSensitive: false), '')
+      .split(
+        RegExp(
+          r'[.;,]?\s+(?:карта|баланс|остаток|доступно|card|balance)(?![a-zа-яё])',
+          caseSensitive: false,
+        ),
+      )
+      .first
+      .replaceAll(RegExp(r'^[\s:;,.-]+|[\s:;,.-]+$'), '');
+  return merchant.isEmpty ||
+          !RegExp(r'[a-zа-яё]', caseSensitive: false).hasMatch(merchant)
+      ? null
+      : merchant;
+}
+
+String? _bareMerchant(String text) {
+  final value = text.trim();
+  final pattern = RegExp(
+    r'^(?:[a-zа-яё0-9._*-]{2,120}|[a-zа-яё0-9]+[._*][ a-zа-яё0-9._*-]{1,118})$',
+    caseSensitive: false,
+  );
+  return pattern.hasMatch(value) &&
+          RegExp(r'[a-zа-яё]', caseSensitive: false).hasMatch(value)
+      ? value
+      : null;
+}
+
 Map<String, dynamic> sharedSubscriptionDraft(
   String text,
   ServiceDirectory directory,
@@ -142,19 +216,25 @@ Map<String, dynamic> sharedSubscriptionDraft(
         r'подписка на ([a-zа-яё][^\n,.;:]{0,59}?)(?=\s+(?:оплачена|продлена|активна|действует|истекает)|[\n,.;:]|$)',
         caseSensitive: false,
       ).firstMatch(text)?[1]?.trim();
-  final service = serviceText == null
-      ? directory.lookup(text, text: true)
-      : directory.lookup(serviceText);
+  final merchant =
+      _field(
+        text,
+        'торговая точка|магазин|продавец|получатель(?: платежа)?|название в выписке|банковское название|merchant(?: name)?|descriptor',
+      ) ??
+      _paymentNotificationMerchant(text) ??
+      _bareMerchant(text);
+  final matched =
+      directory.matchDescriptor(merchant ?? serviceText ?? text) ??
+      (merchant != null ? directory.matchDescriptor(serviceText) : null);
+  final service = matched?.$1;
+  final original = merchant ?? serviceText ?? matched?.$2;
+  final suggestedName = service?.name ?? serviceText ?? original;
   final period = periodFromText(text);
   final bank = _field(text, 'банк|bank');
-  final pricePattern = RegExp(
-    r'(?<![\d.,])([0-9]+(?:[ \u00a0\u202f][0-9]{3})*(?:[.,][0-9]{1,2})?)'
-    r'\s*(₽|руб(?:лей|ля|\.)?|RUB|USD|EUR|€|\$)(?![a-zа-я])',
-    caseSensitive: false,
-  );
   final priceText = _field(text, 'сумма|стоимость|цена|итого|к оплате|amount');
   final price =
-      pricePattern.firstMatch(priceText ?? '') ?? pricePattern.firstMatch(text);
+      _pricePattern.firstMatch(priceText ?? '') ??
+      _pricePattern.firstMatch(text);
   final currency = switch (price?[2]?.toUpperCase()) {
     'USD' || '\$' => 'USD',
     'EUR' || '€' => 'EUR',
@@ -183,14 +263,15 @@ Map<String, dynamic> sharedSubscriptionDraft(
           : null);
   return {
     'source': 'shared',
-    'name': service?.name ?? serviceText,
+    'name': suggestedName == null ? null : limitText(suggestedName, 120),
+    if (original != null) 'bank_merchant': limitText(original, 300),
     'category': service?.category,
     'plan_name': _field(text, 'тариф|план|plan'),
     'amount': price?[1]
         ?.replaceAll(RegExp(r'\s|\u00a0|\u202f'), '')
         .replaceAll(',', '.'),
     'currency': currency,
-    'bank_name': ?bank,
+    if (bank != null) 'bank_name': limitText(bank, 80),
     if (paid != null) 'last_payment_date': isoDay(paid),
     'period': ?period,
     if (predicted != null) 'next_charge_date': isoDay(predicted),

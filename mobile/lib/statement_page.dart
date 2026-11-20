@@ -18,11 +18,30 @@ class StatementPage extends StatefulWidget {
 
 class _StatementPageState extends State<StatementPage> {
   bool reading = false;
+  bool clearing = false;
   bool allPayments = false;
   String query = '';
   String? notice;
 
   DateFormat get format => DateFormat('dd.MM.yyyy');
+
+  Future<void> clearResults() async {
+    setState(() => clearing = true);
+    try {
+      await widget.api.clearStatementResults();
+      if (mounted) {
+        setState(() {
+          allPayments = false;
+          query = '';
+          notice = null;
+        });
+      }
+    } catch (error) {
+      if (mounted) setState(() => notice = error.toString());
+    } finally {
+      if (mounted) setState(() => clearing = false);
+    }
+  }
 
   Future<void> import() async {
     setState(() {
@@ -77,6 +96,8 @@ class _StatementPageState extends State<StatementPage> {
       final directory = api.services;
       final filter = normalizedService(query);
       final coverage = api.statementDates;
+      final hasResults = api.hasStatementResults;
+      final uploads = api.statementUploadDates;
       final candidates = allPayments
           ? const <StatementCandidate>[]
           : findStatementSubscriptions(
@@ -116,9 +137,15 @@ class _StatementPageState extends State<StatementPage> {
             children: [
               FilledButton.icon(
                 icon: const Icon(Icons.file_open_outlined),
-                onPressed: reading ? null : import,
+                onPressed: reading || clearing ? null : import,
                 label: Text(reading ? 'Анализируем…' : 'Выбрать PDF-выписку'),
               ),
+              if (hasResults)
+                OutlinedButton.icon(
+                  icon: const Icon(Icons.clear_all),
+                  onPressed: reading || clearing ? null : clearResults,
+                  label: const Text('Очистить результаты'),
+                ),
               if (reading) const LinearProgressIndicator(),
               if (notice != null)
                 Padding(
@@ -129,18 +156,30 @@ class _StatementPageState extends State<StatementPage> {
                 const Padding(
                   padding: EdgeInsets.only(top: 8),
                   child: Text(
-                    'Поддерживаются текстовые PDF-выписки Сбера и Т-Банка.',
+                    'Поддерживаются текстовые PDF-выписки Сбера, Т-Банка, ВТБ и Альфа-Банка.',
                   ),
+                ),
+              if (coverage.isNotEmpty)
+                const Padding(
+                  padding: EdgeInsets.only(top: 12),
+                  child: Text('Последние выписки'),
                 ),
               for (final entry in coverage.entries)
                 Padding(
-                  padding: const EdgeInsets.only(top: 12),
+                  padding: const EdgeInsets.only(top: 4),
                   child: Text(
-                    '${entry.key.label} · выписка по ${format.format(entry.value)}\n'
-                    'Следующая выписка с ${format.format(entry.value.add(const Duration(days: 1)))}',
+                    '${entry.key.label} · ${format.format(uploads[entry.key] ?? entry.value)}',
                   ),
                 ),
-              if (coverage.isNotEmpty) ...[
+              for (final entry in coverage.entries)
+                if (hasResults)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(
+                      '${entry.key.label} · следующая выписка с ${format.format(entry.value.add(const Duration(days: 1)))}',
+                    ),
+                  ),
+              if (hasResults) ...[
                 const SizedBox(height: 16),
                 SegmentedButton<bool>(
                   segments: const [
@@ -165,7 +204,7 @@ class _StatementPageState extends State<StatementPage> {
             ],
           ),
         ),
-        if (coverage.isNotEmpty && candidates.isEmpty && payments.isEmpty)
+        if (hasResults && candidates.isEmpty && payments.isEmpty)
           () => Text(
             allPayments
                 ? 'Платежи не найдены.'
